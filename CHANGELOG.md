@@ -1,3 +1,12 @@
+## [5.9.1] - 2026-06-05
+
+### Fixed
+- 微量调整
+
+**改动文件：**
+  • `VERSION`
+**触发来源：** session `auto-monitor`
+
 # Changelog
 
 All notable changes to this skill will be documented in this file.
