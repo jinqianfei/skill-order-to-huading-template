@@ -1,12 +1,3 @@
-## [5.9.1] - 2026-06-05
-
-### Fixed
-- 微量调整
-
-**改动文件：**
-  • `VERSION`
-**触发来源：** session `auto-monitor`
-
 # Changelog
 
 All notable changes to this skill will be documented in this file.
@@ -42,9 +33,6 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 - 修复的问题
-
-### Deprecated
-- 已废弃的功能
 
 ### Notes
 - 本次修改的对话背景 session: om_xxx
