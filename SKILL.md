@@ -24,7 +24,7 @@ metadata:
 
 **Description**: 将客户订单（Excel/图片/PDF/文字/Word）转换为华鼎31字段出库单模板的完整流程。
 
-**Version**: 5.11.2 (2026-06-09 — 配置统一化：华鼎字段与数据库表名常量统一来源)
+**Version**: 5.12.0 (2026-06-10 — P1 bug修复：多门店 + 单 confirmed_store 正确处理；2 个回归测试)
 
 
 **架构**：工具层 + 数据库层 + 字段映射规则库 三层分离
@@ -58,7 +58,7 @@ Step 3: _match_store()  ← ⚠️ 人工确认点（不再自动确认）
 Step 4: _match_sku()  ← ⚠️ 人工确认点（SKU映射）
    输入: 商品列表 + owner_code（货主ID）
    处理: product_sku + product_name_alias，5层匹配
-   输出: sku_results + unmatched_items（置信度<0.8告警）
+   输出: need_sku_confirm=True + review_data + sku_results + unmatched_items
 
          ↓ 【用户确认SKU映射结果】
 
@@ -525,7 +525,18 @@ if result.get("need_store_confirm"):
     result = skill.execute(
         order_input=order_input,
         order_type=order_type,
+        order_data_cache=result["order_data_cache"],
         confirmed_store=result["matched_store"]
+    )
+
+# 确认SKU映射后生成Excel
+if result.get("need_sku_confirm"):
+    result = skill.execute(
+        order_input=order_input,
+        order_type=order_type,
+        order_data_cache=result["order_data_cache"],
+        confirmed_store={"confirmed_stores": result["confirmed_stores"]},
+        confirmed_sku=True
     )
 ```
 
@@ -593,8 +604,8 @@ class OrderToHuadingTemplate:
     __公开接口__ = ['execute']
     
     # 内部工具函数（AI 不得直接调用）
-    def _tools_parse(self, ...):  # ← AI 不应直接调用
-    def _tools_transform(self, ...):  # ← AI 不应直接调用
+    def tools_parse(self, ...):  # ← AI 不应直接调用
+    def tools_transform(self, ...):  # ← AI 不应直接调用
     def _match_store(self, ...):  # ← AI 不应直接调用
     def _match_sku(self, ...):  # ← AI 不应直接调用
 ```
@@ -612,6 +623,7 @@ AI 在执行任何 Skill 操作前，必须先读取并检查 `TOOLS.md` 配置�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 5.12.0 | 2026-06-10 | P1 bug修复：多门店 + 单 confirmed_store 正确处理；引入 `confirmed_stores: Dict[str, Dict]`；2 个新回归测试 |
 | 5.8 | 2026-06-01 | 数据库合并：product_sku（1832条）+ product_name_alias（30条）；SKU匹配5层逻辑（Layer 0别名表）；删除system_sku + shipper_sku_mapping |
 | 5.3 | 2026-05-29 | 映射对照表9列字段规范化；移除门店标题分隔行；序号改为门店序号 |
 | 5.2 | 2026-05-29 | 门店匹配强制用户确认（移除auto_confirm），多门店序号格式 |
