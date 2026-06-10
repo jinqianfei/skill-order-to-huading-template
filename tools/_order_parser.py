@@ -13,6 +13,29 @@ import re
 import json
 from typing import Optional, Dict, Any
 
+# LLM Router 导入
+try:
+    from learn.llm import LLMRouter
+except ImportError:
+    LLMRouter = None  # 兼容：未安装 LLM 模块时降级到旧逻辑
+
+
+# 全局 Router 实例（延迟初始化）
+_llm_router = None
+
+
+def _get_llm_router():
+    """获取 LLM Router 实例（延迟初始化）"""
+    global _llm_router
+    if _llm_router is None:
+        if LLMRouter is None:
+            raise RuntimeError("LLM Router 模块未安装，无法调用 LLM")
+        # 配置文件路径：相对于 skill 目录
+        skill_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        config_path = os.path.join(skill_dir, "config", "llm.yaml")
+        _llm_router = LLMRouter(config_path)
+    return _llm_router
+
 
 # =============================================================================
 # 公共入口函数
@@ -323,8 +346,18 @@ def _parse_text(text: str) -> Dict[str, Any]:
         if result.get("success"):
             result["extracted_from"] = "text"
             result["_parse_method"] = "llm"
+        else:
+            result = _parse_text_regex(text)
+            result["extracted_from"] = "text"
+            result["_parse_method"] = "regex_fallback"
         return result
     except Exception as e:
+        result = _parse_text_regex(text)
+        if result.get("success"):
+            result["extracted_from"] = "text"
+            result["_parse_method"] = "regex_fallback"
+            result.setdefault("warnings", []).append(f"LLM解析异常，已使用文本fallback: {str(e)}")
+            return result
         return {"success": False, "error": f"文本解析失败: {str(e)}"}
 
 
@@ -332,11 +365,161 @@ def _parse_text(text: str) -> Dict[str, Any]:
 # Excel正则fallback
 # =============================================================================
 
+def _parse_text_regex(text: str) -> Dict[str, Any]:
+    """文本正则fallback，支持字段行 + 商品明细行。"""
+    order_no = ""
+    store_name = ""
+    contact_person = ""
+    phone = ""
+    address = ""
+    items = []
+    warnings = ["文本fallback解析"]
+
+    field_aliases = {
+        "order_no": ["订单编号", "订单号", "单号"],
+        "store_name": ["公司名称", "门店名称", "门店", "客户名称", "店名"],
+        "contact_person": ["联系人", "收货人", "收货人姓名", "收件人"],
+        "phone": ["联系电话", "手机号", "手机", "电话"],
+        "address": ["收货地址", "地址", "配送地址"],
+    }
+
+    def strip_label_value(line: str, aliases: list) -> Optional[str]:
+        for alias in aliases:
+            if line.startswith(alias):
+                value = line[len(alias):]
+                value = re.sub(r"^[\s：:,，、]+", "", value)
+                return value.strip()
+        return None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        matched_field = False
+        for field, aliases in field_aliases.items():
+            value = strip_label_value(line, aliases)
+            if value is None:
+                continue
+            matched_field = True
+            if field == "order_no" and not order_no:
+                order_no = value
+            elif field == "store_name" and not store_name:
+                store_name = value
+            elif field == "contact_person" and not contact_person:
+                contact_person = value
+            elif field == "phone" and not phone:
+                phone = value
+            elif field == "address" and not address:
+                address = value
+            break
+
+        if matched_field:
+            continue
+
+        item = _parse_text_item_row(line)
+        if item:
+            item["seq"] = len(items) + 1
+            items.append(item)
+
+    if not store_name or not items:
+        return {
+            "success": False,
+            "error": "文本fallback未识别到门店或商品明细",
+            "warnings": warnings,
+        }
+
+    for prefix in ['河北-', '天津-', '沧州-', '创宇-', '盐城创宇-']:
+        if store_name.startswith(prefix):
+            store_name = store_name[len(prefix):]
+            break
+
+    return {
+        "success": True,
+        "confidence": 0.6,
+        "stores": {
+            store_name: {
+                "store_name": store_name,
+                "contact_person": contact_person,
+                "phone": phone,
+                "address": address,
+                "order_no": order_no,
+                "items": items,
+            }
+        },
+        "warnings": warnings,
+    }
+
+
+def _parse_text_item_row(line: str) -> Optional[Dict[str, Any]]:
+    """解析 '1 P9456694174 椰果果粒 规格：2kg*10袋 3 件' 这类商品行。"""
+    parts = line.split()
+    if len(parts) < 3:
+        return None
+
+    first = parts[0].rstrip(".、")
+    if not re.match(r"^\d+$", first):
+        return None
+
+    unit = "件"
+    quantity = 0
+    quantity_idx = -1
+    for idx in range(len(parts) - 1, 0, -1):
+        token = parts[idx]
+        if re.match(r"^\d+(?:\.\d+)?$", token):
+            quantity = int(float(token))
+            quantity_idx = idx
+            if idx + 1 < len(parts) and parts[idx + 1] in ["箱", "件", "袋", "包", "个", "瓶", "桶", "条", "盒", "台"]:
+                unit = parts[idx + 1]
+            break
+
+    if quantity_idx < 0 or quantity <= 0:
+        return None
+
+    product_code = ""
+    name_start = 1
+    if len(parts) > 1 and re.match(r"^[A-Za-z][A-Za-z0-9]{2,}$", parts[1]):
+        product_code = parts[1]
+        name_start = 2
+
+    name_and_spec = parts[name_start:quantity_idx]
+    if not name_and_spec:
+        return None
+
+    product_name_parts = []
+    spec_parts = []
+    spec_started = False
+    for token in name_and_spec:
+        if spec_started or re.search(r"(规格|件：|箱：|袋：|kg|KG|g|G|[*×])", token):
+            spec_started = True
+            spec_parts.append(token)
+        else:
+            product_name_parts.append(token)
+
+    product_name = "".join(product_name_parts).strip()
+    spec = " ".join(spec_parts).strip()
+    if not product_name:
+        return None
+
+    return {
+        "seq": 0,
+        "product_code": product_code,
+        "product_name": product_name,
+        "spec": spec,
+        "quantity": quantity,
+        "unit": unit,
+        "remark": "",
+    }
+
 def _parse_excel_regex(file_path: str) -> Dict[str, Any]:
     """Excel正则fallback（LLM失败时用）"""
     try:
         import pandas as pd
         df_raw = pd.read_excel(file_path, header=None)
+        header_detail_result = _parse_excel_header_detail(df_raw)
+        if header_detail_result.get("success"):
+            return header_detail_result
+
         data_start = 6
         col_mapping = {}
         for row_idx in [0, 1, 2, 3, 4, 5, 6]:
@@ -391,14 +574,184 @@ def _parse_excel_regex(file_path: str) -> Dict[str, Any]:
         return {"success": False, "error": f"Excel正则解析失败: {str(e)}"}
 
 
+def _parse_excel_header_detail(df_raw) -> Dict[str, Any]:
+    """
+    解析常见的「订单头 + 商品明细表」Excel。
+
+    示例：
+      订单编号 | DH-O-...
+      公司名称 | 任丘三中店 | ... | 联系人 | 任建华
+      收货地址 | ...       | ... | 联系电话 | 181...
+      商 品 明 细
+      序号 | 商品编码 | 商品名称 | 商品规格 | 数量 | 计量单位 | 备注
+      1    | P...     | 椰果果粒 | ...      | 3    | 件
+    """
+    import pandas as pd
+
+    def cell(row_idx: int, col_idx: int) -> str:
+        if row_idx < 0 or row_idx >= len(df_raw) or col_idx < 0 or col_idx >= len(df_raw.columns):
+            return ""
+        val = df_raw.iloc[row_idx, col_idx]
+        if pd.isna(val):
+            return ""
+        text = str(val).strip()
+        if text.lower() == "nan":
+            return ""
+        return text
+
+    def normalize_label(value: str) -> str:
+        return re.sub(r"[\s\u3000：:]+", "", str(value or "")).strip()
+
+    def row_values(row_idx: int) -> list:
+        return [cell(row_idx, col_idx) for col_idx in range(len(df_raw.columns))]
+
+    def find_value_after_label(row_idx: int, labels: list) -> str:
+        values = row_values(row_idx)
+        normalized_labels = {normalize_label(label) for label in labels}
+        for col_idx, value in enumerate(values):
+            if normalize_label(value) in normalized_labels:
+                for next_col in range(col_idx + 1, len(values)):
+                    if values[next_col]:
+                        return values[next_col]
+        return ""
+
+    order_no = ""
+    store_name = ""
+    contact_person = ""
+    phone = ""
+    address = ""
+    header_row_idx = None
+
+    for row_idx in range(len(df_raw)):
+        values = row_values(row_idx)
+        normalized = [normalize_label(v) for v in values]
+        non_empty = [v for v in normalized if v]
+
+        if not order_no:
+            order_no = find_value_after_label(row_idx, ["订单编号", "订单号", "单号"])
+        if not store_name:
+            store_name = find_value_after_label(row_idx, ["公司名称", "门店名称", "门店", "客户名称", "店名"])
+        if not contact_person:
+            contact_person = find_value_after_label(row_idx, ["联系人", "收货人", "收货人姓名", "收件人"])
+        if not phone:
+            phone = find_value_after_label(row_idx, ["联系电话", "手机号", "手机", "电话"])
+        if not address:
+            address = find_value_after_label(row_idx, ["收货地址", "地址", "配送地址"])
+
+        has_item_header = (
+            any(v in {"序号", "商品编码", "商品名称", "品名"} for v in normalized)
+            and any(v in {"数量", "订货数量", "订单数量"} for v in normalized)
+            and any(v in {"商品名称", "品名", "货品名称"} for v in normalized)
+        )
+        if has_item_header:
+            header_row_idx = row_idx
+            break
+
+        if any("商品明细" in v or "商品詳情" in v for v in non_empty):
+            continue
+
+    if header_row_idx is None or not store_name:
+        return {"success": False, "error": "未识别到订单头+商品明细格式"}
+
+    header_mapping = {}
+    for col_idx, value in enumerate(row_values(header_row_idx)):
+        label = normalize_label(value)
+        if not label:
+            continue
+        std_field = _find_standard_field(label)
+        if std_field:
+            header_mapping[std_field] = col_idx
+        elif label in {"计量单位", "销售单位"}:
+            header_mapping["unit"] = col_idx
+        elif label in {"备注", "备注信息"}:
+            header_mapping["remark"] = col_idx
+
+    if "product_name" not in header_mapping or "quantity" not in header_mapping:
+        return {"success": False, "error": "商品明细表头缺少商品名称或数量"}
+
+    items = []
+    for row_idx in range(header_row_idx + 1, len(df_raw)):
+        first_cell = normalize_label(cell(row_idx, 0))
+        row_text = "".join(row_values(row_idx))
+        if not row_text:
+            continue
+        if first_cell.startswith("合计") or first_cell in {"合计", "总计"}:
+            break
+
+        product_name = cell(row_idx, header_mapping["product_name"])
+        if not product_name or normalize_label(product_name) in {"商品名称", "品名"}:
+            continue
+
+        quantity = _safe_int_excel(cell(row_idx, header_mapping["quantity"]))
+        if quantity <= 0:
+            continue
+
+        product_code = cell(row_idx, header_mapping.get("product_code", -1))
+        spec = cell(row_idx, header_mapping.get("spec", -1))
+        unit = cell(row_idx, header_mapping.get("unit", -1)) or "件"
+        remark = cell(row_idx, header_mapping.get("remark", -1))
+
+        seq_raw = cell(row_idx, header_mapping.get("seq", 0))
+        seq = _safe_int_excel(seq_raw) or len(items) + 1
+
+        items.append({
+            "seq": seq,
+            "product_code": product_code,
+            "product_name": product_name,
+            "spec": spec,
+            "quantity": quantity,
+            "unit": unit,
+            "remark": remark,
+        })
+
+    if not items:
+        return {"success": False, "error": "未识别到商品明细"}
+
+    for prefix in ['河北-', '天津-', '沧州-', '创宇-', '盐城创宇-']:
+        if store_name.startswith(prefix):
+            store_name = store_name[len(prefix):]
+            break
+
+    return {
+        "success": True,
+        "confidence": 0.8,
+        "stores": {
+            store_name: {
+                "store_name": store_name,
+                "contact_person": contact_person,
+                "phone": phone,
+                "address": address,
+                "order_no": order_no,
+                "items": items,
+            }
+        },
+        "warnings": ["Excel订单头+商品明细fallback解析"],
+    }
+
+
+def _safe_int_excel(value) -> int:
+    """Excel 数量/序号转 int，支持 '3.0'、'数量：3' 等输入。"""
+    if value is None:
+        return 0
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return 0
+    match = re.search(r"\d+(?:\.\d+)?", text)
+    if not match:
+        return 0
+    return int(float(match.group(0)))
+
+
 def _find_standard_field(input_name: str) -> Optional[str]:
     """将任意字段名映射到标准字段名"""
     FIELD_MAP = {
         "store_name": ["往来单位名称", "门店名称", "门店", "店名", "店铺", "收货方"],
+        "seq": ["序号", "行号"],
         "product_name": ["商品名称", "商品名", "品名", "商品", "货品名称", "产品名称"],
         "quantity": ["数量", "件数", "箱数", "qty", "出库数量", "订货数量"],
         "unit": ["销售单位", "单位", "件", "箱", "包装单位"],
-        "spec": ["规格", "包装规格", "规格型号"],
+        "spec": ["规格", "包装规格", "规格型号", "商品规格", "产品规格"],
+        "product_code": ["商品编码", "编码", "货号", "SKU", "商品SKU"],
         "order_no": ["单据日期", "订单号", "单号", "订单编号"],
     }
     input_lower = input_name.lower().strip()
@@ -519,65 +872,46 @@ def _load_env():
 
 
 def _call_llm(text_content: str, content_type: str = "text") -> Dict[str, Any]:
-    """调用 LLM 解析订单文本"""
+    """
+    调用 LLM 解析订单文本
+    
+    使用 LLM Router，支持多种 provider（默认 openclaw 平台内嵌模型）
+    支持故障回退链
+    """
     try:
-        import openai
-        for k in ["SOCKS_PROXY", "ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"]:
-            os.environ.pop(k, None)
+        # 加载 .env
         _load_env()
-        api_key = os.getenv("MINIMAX_API_KEY") or os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            return {"success": False, "error": "未设置 MINIMAX_API_KEY 或 OPENAI_API_KEY"}
-
+        
+        # 构建 prompt
         prompt_template = _MULTI_PROMPT_TEMPLATE if content_type == "excel" else _SINGLE_PROMPT_TEMPLATE
-        prompt = prompt_template.format(content=text_content[:12000] if len(text_content) > 12000 else text_content)
-
-        # 优先使用 MiniMax
-        if os.getenv("MINIMAX_API_KEY"):
-            client = openai.OpenAI(
-                api_key=api_key,
-                base_url="https://api.minimax.chat/v1",
-            )
-            response = client.chat.completions.create(
-                model="MiniMax-M2.7",
-                messages=[
-                    {"role": "system", "content": "你是一个专业的订单数据提取专家。请从用户提供的订单内容中准确提取结构化信息。"},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,
-                max_tokens=4000
-            )
-        else:
-            client = openai.OpenAI(api_key=api_key)
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "你是一个专业的订单数据提取专家。请从用户提供的订单内容中准确提取结构化信息。"},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,
-                max_tokens=4000
-            )
-
-        raw_output = response.choices[0].message.content.strip()
-
-        # 解析 JSON
+        prompt = prompt_template.format(
+            content=text_content[:12000] if len(text_content) > 12000 else text_content
+        )
+        
+        system_msg = "你是一个专业的订单数据提取专家。请从用户提供的订单内容中准确提取结构化信息。"
+        
+        # 通过 Router 调用 LLM
+        router = _get_llm_router()
+        response = router.chat(system=system_msg, user=prompt)
+        
+        raw_output = response.text
+        
+        # 解析 JSON（与原来逻辑一致）
         if raw_output.startswith("```"):
             raw_output = raw_output.split("```")[1]
             if raw_output.startswith("json"):
                 raw_output = raw_output[4:]
             raw_output = raw_output.strip().strip("```")
-
+        
         # 移除思考过程标签
-        raw_output = re.sub(r'<think>.*?</think>', '', raw_output, flags=re.DOTALL)
+        raw_output = re.sub(r'', '', raw_output, flags=re.DOTALL)
         raw_output = re.sub(r'<!--.*?-->', '', raw_output, flags=re.DOTALL)
         raw_output = raw_output.strip()
-
+        
         return _parse_llm_raw(raw_output)
+        
     except Exception as e:
         return {"success": False, "error": f"LLM调用失败: {str(e)}"}
-
-
 def _parse_llm_raw(raw_output: str) -> Dict[str, Any]:
     """解析 LLM 原始输出"""
     code_blocks = raw_output.split("```")
