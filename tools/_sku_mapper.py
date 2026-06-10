@@ -16,44 +16,38 @@ from typing import Optional, Dict, Any, List, Tuple
 from difflib import SequenceMatcher
 import re
 import psycopg2
+import sys
+import os
+
+# 允许独立运行（不依赖主入口）：将 skill 根目录加入 sys.path
+_SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SKILL_ROOT not in sys.path:
+    sys.path.insert(0, _SKILL_ROOT)
+
+from db.connection import get_connection, get_default_db_config
+from db.table_names import SKU_TABLE, WAREHOUSE_TABLE, ALIAS_TABLE, STORE_TABLE, ACTIVE_STATUS, SKU_CACHE_LIMIT, SKU_MATCH_LIMIT
 
 
 def _clean_product_name(name: str) -> str:
     """
-    清洗订单商品名称：去除规格描述，保留核心商品名
+    清洗订单商品名称：去除括号内容，保留核心商品名
     
     规则：
-    1. 如果"—"在括号内容之后，去除"—"后的别名后缀
-       例如：鱼你幸福青花椒酱料（新款）—原椒麻酱料 → 鱼你幸福青花椒酱料
-    2. 如果"—"在括号内容之前或没有括号，则保留（它是产品名的一部分）
-       例如：冻品—鱼你幸福猪肉片（1KG*12包/箱） → 冻品鱼你幸福猪肉片
-    3. 去除所有括号及其内容
+    1. 只去除括号及其内容（括号通常是规格/别名描述）
+    2. 保留所有连接符（-、—、_）和空格，因为它们可能是商品名的一部分
+    3. 例如：
+       - 辣白菜D-X-H → 辣白菜D-X-H （保留）
+       - 鱼你幸福青花椒酱料（新款） → 鱼你幸福青花椒酱料
+       - 冻品—鱼你幸福猪肉片（1KG*12包/箱） → 冻品—鱼你幸福猪肉片
+    
+    修复记录（2026-06-09）：
+    - 原逻辑错误去掉了 - 和连接符，导致 Layer 1 精确匹配失败
+    - 例如 辣白菜D-X-H 被洗成 辣白菜DXH，与数据库不匹配
     """
-    original_name = name
-    
-    # 提取括号内容
-    bracket_match = re.search(r'[（(]([^)）]+)[)）]', name)
-    bracket_content = bracket_match.group(1) if bracket_match else ""
-    
-    # 找到括号内容的位置
-    bracket_pos = -1
-    if bracket_content:
-        bracket_pos = name.find(f'（{bracket_content}）')
-        if bracket_pos == -1:
-            bracket_pos = name.find(f'({bracket_content})')
-    
-    # 如果有括号，且括号后有"—"，去除"—"及之后的内容
-    if bracket_content and bracket_pos >= 0:
-        after_bracket = name[bracket_pos + len(bracket_content) + 2:]
-        if after_bracket and re.match(r'^[—–\-]', after_bracket):
-            name = name[:bracket_pos + len(bracket_content) + 2]
-    
     # 去除所有括号及其内容
     cleaned = re.sub(r'[（(][^)）]*[)）]', '', name)
-    
-    # 去除多余的空格和连接符
-    cleaned = re.sub(r'[\s\-—–]+', '', cleaned)
-    
+    # 去除多余空格，但保留连接符（-、—、_）
+    cleaned = re.sub(r'\s+', '', cleaned)
     return cleaned.strip()
 
 
@@ -203,7 +197,7 @@ def _has_core_word_match(clean_name: str, sku_name: str) -> bool:
 def map_sku(owner_code: str, product_name: str, unit: str = "",
             db_config: Optional[dict] = None) -> dict:
     """
-    SKU映射 - 5层匹配策略，查 product_sku 表，按 shipper_id 过滤
+    SKU映射 - 5层匹配策略，查 SKU_TABLE 表，按 shipper_id 过滤
     
     Layer 0: 别名表查表（完整订单商品名精确匹配）
     Layer 1: 精确匹配（sku_name 或 customer_code 完全一致）
@@ -230,7 +224,7 @@ def map_sku(owner_code: str, product_name: str, unit: str = "",
         }
     """
     if db_config is None:
-        db_config = {"host": "localhost", "port": 5432, "database": "neo", "user": "jinqianfei"}
+        db_config = get_default_db_config()
     
     # 预处理：去除各种空白字符
     import re
@@ -239,7 +233,7 @@ def map_sku(owner_code: str, product_name: str, unit: str = "",
             return ""
         name = str(name)
         name = name.strip()
-        name = re.sub(r'[\t\u00a0\u3000\u200b\-\u200f\ufeff]+', '', name)
+        name = re.sub(r'[\t\u00a0\u3000\u200b\u200f\ufeff]+', '', name)  # 保留连接符 -
         name = name.replace(' ', '')
         return name
     
@@ -256,10 +250,10 @@ def map_sku(owner_code: str, product_name: str, unit: str = "",
     clean_name = _clean_product_name(product_name)
     
     # ========== Layer 0: 别名表查表 ==========
-    cur.execute("""
+    cur.execute(f"""
         SELECT p.sku_code, p.sku_name, p.unit, p.unit_type, p.conversion_ratio, p.product_spec, p.customer_code
-        FROM product_name_alias a
-        JOIN product_sku p ON p.sku_name = a.system_product_name AND p.shipper_id = a.shipper_id
+        FROM {ALIAS_TABLE} a
+        JOIN {SKU_TABLE} p ON p.sku_name = a.system_product_name AND p.shipper_id = a.shipper_id
         WHERE a.shipper_id = %s AND a.order_product_name = %s
         ORDER BY p.unit_type DESC
         LIMIT 3
@@ -273,10 +267,10 @@ def map_sku(owner_code: str, product_name: str, unit: str = "",
         return result
 
     # ========== Layer 1: 精确匹配（原始名称） ==========
-    cur.execute("""
+    cur.execute(f"""
         SELECT sku_code, sku_name, unit, unit_type, conversion_ratio, product_spec, customer_code
-        FROM product_sku
-        WHERE shipper_id = %s AND status = 'ACTIVE'
+        FROM {SKU_TABLE}
+        WHERE shipper_id = %s AND status = '{ACTIVE_STATUS}'
           AND (sku_name = %s OR customer_code = %s)
         ORDER BY CASE WHEN unit_type = '大单位' THEN 0 ELSE 1 END
     """, (owner_code, product_name, product_name))
@@ -290,10 +284,10 @@ def map_sku(owner_code: str, product_name: str, unit: str = "",
 
     # ========== Layer 1b: 精确匹配（清洗后名称） ==========
     if clean_name != product_name:
-        cur.execute("""
+        cur.execute(f"""
             SELECT sku_code, sku_name, unit, unit_type, conversion_ratio, product_spec, customer_code
-            FROM product_sku
-            WHERE shipper_id = %s AND status = 'ACTIVE'
+            FROM {SKU_TABLE}
+            WHERE shipper_id = %s AND status = '{ACTIVE_STATUS}'
               AND (sku_name = %s OR customer_code = %s)
             ORDER BY CASE WHEN unit_type = '大单位' THEN 0 ELSE 1 END
         """, (owner_code, clean_name, clean_name))
@@ -322,10 +316,10 @@ def map_sku(owner_code: str, product_name: str, unit: str = "",
 
     # ========== Layer 2: 模糊匹配（清洗后名称） ==========
     if clean_name != product_name:
-        cur.execute("""
+        cur.execute(f"""
             SELECT sku_code, sku_name, unit, unit_type, conversion_ratio, product_spec, customer_code
-            FROM product_sku
-            WHERE shipper_id = %s AND status = 'ACTIVE'
+            FROM {SKU_TABLE}
+            WHERE shipper_id = %s AND status = '{ACTIVE_STATUS}'
               AND sku_name LIKE %s
         """, (owner_code, f"%{clean_name}%"))
         rows = cur.fetchall()
@@ -353,7 +347,7 @@ def map_sku(owner_code: str, product_name: str, unit: str = "",
                 return result
     
     # ========== Layer 2.5: 全量相似度匹配（始终执行，当Layer 2无结果时兜底） ==========
-    cur.execute("SELECT sku_code, sku_name, unit, unit_type, conversion_ratio, product_spec, customer_code FROM product_sku WHERE shipper_id = %s AND status = 'ACTIVE' LIMIT 200", (owner_code,))
+    cur.execute(f"SELECT sku_code, sku_name, unit, unit_type, conversion_ratio, product_spec, customer_code FROM {SKU_TABLE} WHERE shipper_id = %s AND status = '{ACTIVE_STATUS}' LIMIT {SKU_CACHE_LIMIT}", (owner_code,))
     all_skus = cur.fetchall()
     if all_skus:
         scored = []
@@ -397,7 +391,7 @@ def map_sku(owner_code: str, product_name: str, unit: str = "",
     
     all_matches = []
     for keyword in keywords:
-        cur.execute("SELECT sku_code, sku_name, unit, unit_type, conversion_ratio, product_spec, customer_code FROM product_sku WHERE shipper_id = %s AND status = 'ACTIVE' AND sku_name LIKE %s LIMIT 20", (owner_code, f"%{keyword}%"))
+        cur.execute(f"SELECT sku_code, sku_name, unit, unit_type, conversion_ratio, product_spec, customer_code FROM {SKU_TABLE} WHERE shipper_id = %s AND status = '{ACTIVE_STATUS}' AND sku_name LIKE %s LIMIT {SKU_MATCH_LIMIT}", (owner_code, f"%{keyword}%"))
         rows = cur.fetchall()
         for r in rows:
             # 核心词校验 - 排除不同口味调料的错误匹配
@@ -465,6 +459,7 @@ def _build_result(row: tuple, confidence: float, original_product_name: str = ""
         "product_spec": row[5] or "",
         "unit_original": row[2],
         "original_product_name": original_product_name,
+        "product_name": original_product_name,
     }
 
 
@@ -491,11 +486,11 @@ class SKUCache:
             return self
         conn = psycopg2.connect(**self.db_config)
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(f"""
             SELECT sku_code, sku_name, unit, unit_type,
                    conversion_ratio, product_spec, customer_code
-            FROM product_sku
-            WHERE shipper_id = %s AND status = 'ACTIVE'
+            FROM {SKU_TABLE}
+            WHERE shipper_id = %s AND status = '{ACTIVE_STATUS}'
         """, (self.owner_code,))
         self._rows = cur.fetchall()
         conn.close()
@@ -534,14 +529,14 @@ def map_sku_batch(owner_code: str, items: List[Dict],
         (results, unmatched_items) — 与 map_sku() 返回格式兼容
     """
     if db_config is None:
-        db_config = {"host": "localhost", "port": 5432, "database": "neo", "user": "jinqianfei"}
+        db_config = get_default_db_config()
 
     # 预处理
     def clean_name_text(name):
         if not name:
             return ""
         name = str(name).strip()
-        name = re.sub(r'[\t\u00a0\u3000\u200b\-\u200f\ufeff]+', '', name)
+        name = re.sub(r'[\t\u00a0\u3000\u200b\u200f\ufeff]+', '', name)  # 保留连接符 -
         name = name.replace(' ', '')
         return name
 
@@ -552,11 +547,11 @@ def map_sku_batch(owner_code: str, items: List[Dict],
     # 加载别名表（一次 DB 查询）
     conn = psycopg2.connect(**db_config)
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         SELECT a.order_product_name, p.sku_code, p.sku_name, p.unit, p.unit_type,
                p.conversion_ratio, p.product_spec, p.customer_code
-        FROM product_name_alias a
-        JOIN product_sku p ON p.sku_name = a.system_product_name AND p.shipper_id = a.shipper_id
+        FROM {ALIAS_TABLE} a
+        JOIN {SKU_TABLE} p ON p.sku_name = a.system_product_name AND p.shipper_id = a.shipper_id
         WHERE a.shipper_id = %s
     """, (owner_code,))
     alias_rows = {r[0]: r[1:] for r in cur.fetchall()}  # order_product_name -> (sku_code, sku_name, ...)
@@ -570,6 +565,7 @@ def map_sku_batch(owner_code: str, items: List[Dict],
         spec = item.get("spec", "")
         unit = item.get("unit", "件")
         seq = item.get("seq", 0)
+        quantity = item.get("quantity", 0)
 
         result = _map_single_in_batch(
             owner_code, clean_name_text(product_name),
@@ -579,11 +575,18 @@ def map_sku_batch(owner_code: str, items: List[Dict],
         )
 
         if result["matched"]:
+            # 【Bugfix 2026-06-09】把订单原 quantity/unit/spec 透传进 result
+            # 之前 _build_result 不返回 quantity，导致 __init__._match_sku 里
+            # r.get("quantity", 0) 拿到默认值 0，最终 31 字段 Excel 的"出库数量"列 = 0
+            result["quantity"] = quantity
+            result["unit"] = unit
+            result["spec"] = spec
+            result["seq"] = seq
             results.append(result)
         else:
             unmatched_items.append({
                 "seq": seq, "product_name": product_name,
-                "spec": spec, "quantity": item.get("quantity", 0), "unit": unit})
+                "spec": spec, "quantity": quantity, "unit": unit})
 
     return results, unmatched_items
 
