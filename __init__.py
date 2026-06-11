@@ -394,7 +394,7 @@ def _get_download_url(output_file: str) -> str:
 class OrderToHuadingTemplate:
     """订单转华鼎出库单模板Skill"""
     
-    VERSION = "5.11.2"
+    VERSION = "5.14.0"
     
     # ========== AI调用约束（方案1：技术层面）==========
     # AI 只能调用这些公开接口，不得直接调用内部工具函数
@@ -1880,17 +1880,24 @@ class OrderToHuadingTemplate:
             )
 
             if order_data.get("_multi_store") and order_data.get("stores"):
-                # 【多门店模式】遍历每个门店
+                # 【多门店模式】两阶段处理：
+                #   Phase A: 匹配所有门店 → 一次性展示给用户确认
+                #   Phase B: 全部确认后 → 批量 SKU 匹配
                 stores_dict = order_data["stores"]
 
+                # ── Phase A: 遍历所有门店，收集匹配结果 ──
+                all_store_matches = []   # 所有门店匹配结果（含已确认+待确认）
+                pending_stores = []      # 需要用户确认的门店
+                failed_stores = []       # 匹配失败的门店
+                store_items_map = {}     # store_key → store_items（给 Phase B 用）
+
                 for store_key, store_data in stores_dict.items():
-                    # 获取该门店的商品（带 _store_name 标记的）
+                    # 获取该门店的商品
                     store_items = [it for it in order_data["items"] 
                                    if it.get("_store_name") == store_key 
                                    or it.get("_store_name") == store_data.get("store_name", store_key)]
                     if not store_items:
                         store_items = store_data.get("items", [])
-                        # 转换格式
                         store_items = [{
                             "seq": i + 1,
                             "product_code": str(it.get("product_code", "")).strip(),
@@ -1900,6 +1907,7 @@ class OrderToHuadingTemplate:
                             "unit": str(it.get("unit", "件")).strip(),
                             "remark": str(it.get("remark", "")).strip(),
                         } for i, it in enumerate(store_items)]
+                    store_items_map[store_key] = store_items
 
                     store_name_for_match = store_data.get("store_name", store_key)
                     confirmed_for_store = _confirmed_store_for(
@@ -1912,7 +1920,6 @@ class OrderToHuadingTemplate:
                         si.setdefault("_store_key", store_key)
                         si.setdefault("store_name_submitted", store_name_for_match)
                         confirmed_stores[store_key] = si
-                        # v5.9.0 Phase 1：emit 门店已确认事件
                         if _HAS_EVENT_BUS:
                             EventBus.emit("store_confirmed", {
                                 "session_id": order_session_id,
@@ -1933,45 +1940,129 @@ class OrderToHuadingTemplate:
                             address=store_data.get("store_address"),
                             contact_person=store_data.get("contact_person"),
                         )
+
+                    # 处理匹配结果
+                    is_confirmed = bool(confirmed_for_store)
+                    is_auto = False
+                    match_status = "pending"
+
                     if not si:
-                        return {
-                            **get_friendly_error("E201", f"门店「{store_name_for_match}」未找到匹配"),
-                            "need_store_match": True,
-                            "store_name_submitted": store_name_for_match
-                        }
-                    if si.get("need_customer_hint"):
-                        return {
-                            "success": False,
-                            "need_customer_hint": True,
+                        failed_stores.append({
+                            "store_key": store_key,
                             "store_name_submitted": store_name_for_match,
+                            "error": "门店未找到匹配",
+                        })
+                        match_status = "failed"
+                    elif si.get("need_customer_hint"):
+                        failed_stores.append({
+                            "store_key": store_key,
+                            "store_name_submitted": store_name_for_match,
+                            "error": "需要货主提示",
                             "possible_customers": si.get("possible_customers", []),
-                            "message": f"门店「{store_name_for_match}」未找到匹配，但可能属于以下货主"
-                        }
-                    if not confirmed_for_store and not _is_auto_confirmed_store_match(si):
-                        response = _store_confirm_response(
-                            store_name_for_match,
-                            si,
-                            store_key=store_key,
-                            order_data_cache=_order_cache_with_confirmations(order_data, confirmed_stores),
-                            confirmed_stores=confirmed_stores,
-                        )
-                        if _HAS_EVENT_BUS:
-                            EventBus.emit("store_confirm_needed", {
-                                "session_id": order_session_id,
-                                "timestamp": time.time(),
-                                "store_name_submitted": store_name_for_match,
-                                "matched_store": response["matched_store"],
-                                "candidates": response.get("candidates", []),
-                                "top_similarity": response["matched_store"].get("similarity", 0),
-                                "match_type": response["matched_store"].get("match_type", "unknown"),
-                                "match_layer": response["matched_store"].get("match_type", "unknown"),
-                                "need_customer_hint": False,
-                            })
-                        return response
-                    if not confirmed_for_store and _is_auto_confirmed_store_match(si):
+                        })
+                        match_status = "need_hint"
+                    elif confirmed_for_store:
+                        is_confirmed = True
+                        is_auto = True
+                        match_status = "confirmed"
+                    elif _is_auto_confirmed_store_match(si):
                         si.setdefault("_store_key", store_key)
                         si.setdefault("store_name_submitted", store_name_for_match)
                         confirmed_stores[store_key] = si
+                        is_confirmed = True
+                        is_auto = True
+                        match_status = "auto_confirmed"
+                    else:
+                        # 需要用户确认
+                        pending_stores.append(store_key)
+                        match_status = "pending"
+
+                    # 构建该门店的匹配结果
+                    store_match_info = {
+                        "store_key": store_key,
+                        "store_name_submitted": store_name_for_match,
+                        "items_count": len(store_items),
+                        "items": store_items,
+                        "status": match_status,
+                        "is_confirmed": is_confirmed,
+                        "is_auto_confirmed": is_auto,
+                    }
+                    if si:
+                        store_match_info["matched_store"] = {
+                            "store_code": si.get("store_code", ""),
+                            "store_name": si.get("store_name", ""),
+                            "owner_code": si.get("owner_code", ""),
+                            "owner_name": si.get("owner_name", ""),
+                            "warehouse_name": si.get("warehouse_name", ""),
+                            "warehouse_code": si.get("warehouse_code", ""),
+                            "address": si.get("address", ""),
+                            "contact_person": si.get("contact_person", ""),
+                            "phone": si.get("phone", ""),
+                            "similarity": si.get("similarity", 0),
+                            "match_type": si.get("match_type", ""),
+                            "match_method": si.get("match_method", ""),
+                            "_store_key": store_key,
+                            "store_name_submitted": store_name_for_match,
+                        }
+                        store_match_info["candidates"] = si.get("candidates", [])
+                    all_store_matches.append(store_match_info)
+
+                # ── 如果有待确认门店 → 一次性返回所有门店匹配结果 ──
+                if pending_stores or failed_stores:
+                    confirmed_count = sum(1 for m in all_store_matches if m["is_confirmed"])
+                    pending_count = len(pending_stores)
+                    failed_count = len(failed_stores)
+
+                    if _HAS_EVENT_BUS:
+                        for pm in all_store_matches:
+                            if pm["status"] == "pending" and pm.get("matched_store"):
+                                EventBus.emit("store_confirm_needed", {
+                                    "session_id": order_session_id,
+                                    "timestamp": time.time(),
+                                    "store_name_submitted": pm["store_name_submitted"],
+                                    "matched_store": pm["matched_store"],
+                                    "candidates": pm.get("candidates", []),
+                                    "top_similarity": pm["matched_store"].get("similarity", 0),
+                                    "match_type": pm["matched_store"].get("match_type", "unknown"),
+                                    "match_layer": pm["matched_store"].get("match_type", "unknown"),
+                                    "need_customer_hint": False,
+                                    "batch_mode": True,
+                                    "batch_total": len(all_store_matches),
+                                    "batch_pending": pending_count,
+                                })
+
+                    # 兼容旧调用方：补回首个 pending 门店的顶层字段
+                    first_pending = next((m for m in all_store_matches if m["status"] == "pending"), None)
+                    compat_fields = {}
+                    if first_pending:
+                        compat_fields["store_name_submitted"] = first_pending.get("store_name_submitted", "")
+                        compat_fields["matched_store"] = first_pending.get("matched_store", {})
+                        compat_fields["candidates"] = first_pending.get("candidates", [])
+
+                    return {
+                        "success": False,
+                        "need_store_confirm": True,
+                        "batch_mode": True,
+                        "all_store_matches": all_store_matches,
+                        "pending_store_keys": pending_stores,
+                        "pending_count": pending_count,
+                        "confirmed_count": confirmed_count,
+                        "failed_count": failed_count,
+                        "failed_stores": failed_stores,
+                        "confirmed_stores": confirmed_stores,
+                        "order_data_cache": _order_cache_with_confirmations(order_data, confirmed_stores),
+                        "message": f"共 {len(all_store_matches)} 个门店：{confirmed_count} 已确认，{pending_count} 待确认，{failed_count} 失败。请确认所有门店后继续",
+                        **compat_fields,
+                    }
+
+                # ── Phase B: 所有门店已确认 → 批量 SKU 匹配 ──
+                for store_key, store_data in stores_dict.items():
+                    store_items = store_items_map.get(store_key, [])
+                    store_name_for_match = store_data.get("store_name", store_key)
+                    si = confirmed_stores.get(store_key)
+                    if not si:
+                        # 不应发生（Phase A 已确保全部确认）
+                        continue
 
                     owner_code = si.get("owner_code", self.shipper_id)
                     sku_results, unmatched_items = object.__getattribute__(self, '_match_sku')(store_items, owner_code)
@@ -2133,6 +2224,64 @@ class OrderToHuadingTemplate:
                     "proposed_output_file": output_file,
                     "message": "SKU映射结果需要确认，请检查映射对照表后继续生成模板",
                 }
+
+            # ========== v5.14.0 audit: 应用用户 SKU 修正 ==========
+            if isinstance(confirmed_sku, dict) and "updates" in confirmed_sku:
+                for update in confirmed_sku["updates"]:
+                    store_key = update.get("store_key", "")
+                    seq = update.get("seq", 0)
+                    new_sku_code = update.get("sku_code", "")
+                    if not store_key or not seq or not new_sku_code:
+                        continue
+                    for sr in all_store_results:
+                        if sr.get("store_name") != store_key and sr.get("store_info", {}).get("_store_key") != store_key:
+                            continue
+                        # 检查未匹配项是否有此 seq
+                        for ui_idx, ui in enumerate(sr.get("unmatched_items", [])):
+                            if ui.get("seq") == seq:
+                                # 将未匹配项移入 sku_results
+                                sr["unmatched_items"].pop(ui_idx)
+                                sr["sku_results"].append({
+                                    "sku_code": new_sku_code,
+                                    "sku_name": update.get("sku_name", ""),
+                                    "unit": update.get("unit", "件"),
+                                    "unit_type": update.get("unit_type", ""),
+                                    "quantity": ui.get("quantity", 1),
+                                    "product_name": ui.get("product_name", ""),
+                                    "match_method": "用户手动选择",
+                                    "confidence": 1.0,
+                                })
+                                break
+                        # 检查已匹配项更新
+                        for sku in sr.get("sku_results", []):
+                            if sku.get("seq") == seq:
+                                if new_sku_code:
+                                    sku["sku_code"] = new_sku_code
+                                if update.get("unit_type"):
+                                    sku["unit_type"] = update["unit_type"]
+                                if update.get("unit"):
+                                    sku["unit"] = update["unit"]
+                                if update.get("quantity") is not None:
+                                    sku["quantity"] = update["quantity"]
+                                sku["match_method"] = "用户手动修正"
+                                break
+                # 重新计算 unmatched
+                all_unmatched = []
+                total_unmatched = 0
+                for sr in all_store_results:
+                    all_unmatched.extend(sr.get("unmatched_items", []))
+                    total_unmatched += len(sr.get("unmatched_items", []))
+                # 如果仍有未匹配项且用户没有全部补齐，阻断生成
+                if total_unmatched > 0:
+                    return {
+                        "success": False,
+                        "need_sku_confirm": True,
+                        "message": f"仍有 {total_unmatched} 个未匹配SKU，请补齐后再继续生成模板",
+                        "unmatched_count": total_unmatched,
+                        "unmatched_items": all_unmatched,
+                        "all_store_results": all_store_results,
+                        "review_data": review_data,
+                    }
 
             # ========== 生成合并模板（所有门店写入同一个sheet）==========
             object.__getattribute__(self, '_generate_multi_store_template')(order_data, all_store_results, output_file)
@@ -2905,13 +3054,18 @@ class OrderToHuadingTemplate:
                 "unit_type": r["unit_type"],
                 "product_spec": r.get("product_spec", ""),
                 "match_method": r.get("match_method", ""),
+                # v5.14.0 audit: 透传审核信号，避免低置信度/多候选被洗白
+                "confidence": r.get("confidence", 1.0),
+                "need_confirm": r.get("need_confirm", False),
+                "candidates": r.get("candidates", []),
+                "original_product_name": r.get("original_product_name", ""),
             })
 
         return formatted_results, unmatched_items
 
     def _get_sku_unit_info(self, sku_code: str, owner_code: str) -> Dict[str, str]:
         """
-        获取SKU的单位信息
+        获取SKU的单位信息（v5.11.2 改为查 product_sku 表，不再查已删除的 shipper_sku_mapping）
         
         Returns:
             dict: {
@@ -2920,92 +3074,54 @@ class OrderToHuadingTemplate:
             }
         """
         try:
-            import psycopg2
-            import json
-            
-            conn = psycopg2.connect(**self.db_config)
+            from db.table_names import SKU_TABLE
+            conn = self._get_db_connection()
             cur = conn.cursor()
             
-            # Step 1: 用 sku_code 找到该SKU对应的商品名称
-            cur.execute("""
-                SELECT m.system_sku_name
-                FROM shipper_sku_mapping m
-                WHERE m.shipper_id = %s AND m.system_sku_code = %s AND m.status = 'ACTIVE'
+            # Step 1: 用 sku_code 找到当前 SKU 的名称、单位、换算比
+            cur.execute(f"""
+                SELECT sku_name, unit, unit_type, conversion_ratio
+                FROM {SKU_TABLE}
+                WHERE sku_code = %s AND shipper_id = %s
                 LIMIT 1
-            """, (owner_code, sku_code))
-            row = cur.fetchone()
-            if not row:
+            """, (sku_code, owner_code))
+            current_row = cur.fetchone()
+            if not current_row:
                 conn.close()
                 return {"unit": "件", "unit_type": "大单位"}
             
-            product_name = row[0]
+            current_name, current_unit, current_unit_type, current_ratio = current_row
             
-            # Step 2: 找到该商品名称对应的所有系统SKU及其单位配置
-            cur.execute("""
-                SELECT m.system_sku_code, m.unit_conversion_rule
-                FROM shipper_sku_mapping m
-                WHERE m.shipper_id = %s 
-                  AND m.system_sku_name = %s 
-                  AND m.status = 'ACTIVE'
-            """, (owner_code, product_name))
+            # 如果数据库已有 unit_type 值，优先使用
+            if current_unit_type:
+                conn.close()
+                return {"unit": current_unit or "件", "unit_type": current_unit_type}
+            
+            # Step 2: 找同名 SKU（同一 shipper_id 下 sku_name 相同），按 conversion_ratio 判断单位类型
+            cur.execute(f"""
+                SELECT sku_code, conversion_ratio, unit
+                FROM {SKU_TABLE}
+                WHERE sku_name = %s AND shipper_id = %s
+            """, (current_name, owner_code))
             all_rows = cur.fetchall()
             conn.close()
             
-            if not all_rows:
-                return {"unit": "件", "unit_type": "大单位"}
+            if len(all_rows) <= 1:
+                return {"unit": current_unit or "件", "unit_type": "大单位"}
             
-            # 提取所有SKU的单位配置: {sku_code: (ratio, unit), ...}
-            sku_units = {}
-            for r in all_rows:
-                s_code = r[0]
-                rule = r[1]
-                if not rule:
-                    continue
-                
-                if isinstance(rule, str):
-                    rule = json.loads(rule)
-                
-                if isinstance(rule, dict):
-                    ratio = rule.get('ratio')
-                    unit = rule.get('unit')
-                    if ratio and unit:
-                        sku_units[s_code] = (float(ratio), unit)
+            # 按 conversion_ratio 排序判断单位类型
+            ratios = sorted(set(r[1] or 1.0 for r in all_rows))
             
-            if not sku_units:
-                return {"unit": "件", "unit_type": "大单位"}
+            if len(ratios) == 1:
+                return {"unit": current_unit or "件", "unit_type": "大单位"}
             
-            # 获取当前sku的单位信息
-            current_unit_info = sku_units.get(sku_code)
-            if not current_unit_info:
-                return {"unit": "件", "unit_type": "大单位"}
-            
-            current_ratio, current_unit = current_unit_info
-            
-            # 只有一个SKU配置时，默认返回"大单位"
-            if len(sku_units) == 1:
-                return {"unit": current_unit, "unit_type": "大单位"}
-            
-            # 多个SKU时，按ratio排序判断单位类型
-            sorted_skus = sorted(sku_units.items(), key=lambda x: x[1][0])
-            
-            if len(sorted_skus) == 2:
-                if current_ratio == sorted_skus[1][1][0]:  # ratio最大
-                    return {"unit": current_unit, "unit_type": "大单位"}
-                else:
-                    return {"unit": current_unit, "unit_type": "小单位"}
-            
-            elif len(sorted_skus) >= 3:
-                min_ratio = sorted_skus[0][1][0]
-                max_ratio = sorted_skus[-1][1][0]
-                
-                if current_ratio == max_ratio:
-                    return {"unit": current_unit, "unit_type": "大单位"}
-                elif current_ratio == min_ratio:
-                    return {"unit": current_unit, "unit_type": "小单位"}
-                else:
-                    return {"unit": current_unit, "unit_type": "中单位"}
-            
-            return {"unit": current_unit, "unit_type": "大单位"}
+            effective_ratio = current_ratio or 1.0
+            if effective_ratio == max(ratios):
+                return {"unit": current_unit or "件", "unit_type": "大单位"}
+            elif effective_ratio == min(ratios):
+                return {"unit": current_unit or "件", "unit_type": "小单位"}
+            else:
+                return {"unit": current_unit or "件", "unit_type": "中单位"}
                 
         except Exception as e:
             print(f"获取单位信息失败: {e}")
@@ -3079,11 +3195,14 @@ class OrderToHuadingTemplate:
                 "sku_name": result["sku_name"],  # SKU名称（华鼎商品名称）
                 "huading_quantity": result.get("quantity", 1),  # 华鼎数量（通常与客户数量一致）
                 "huading_unit": result.get("unit", "件"),  # 华鼎单位
-                "unit_type": result.get("unit_type", "大单位"),  # 单位类型（大/中/小单位）
+                "unit_type": result.get("unit_type", ""),  # 单位类型（大/中/小单位）
                 # 状态
                 "matched": True,
                 "confidence": result.get("confidence", 1.0),
-                "match_method": result.get("match_method", "")
+                "match_method": result.get("match_method", ""),
+                # v5.13.2: 多候选 SKU
+                "candidates": result.get("candidates", []),
+                "need_confirm": result.get("need_confirm", False),
             }
             comparison_table.append(row)
             
@@ -3253,6 +3372,18 @@ class OrderToHuadingTemplate:
             
             line = f"| {seq} | {row['customer_product_name']} | {row['customer_spec']} | {row['customer_unit']} | {row['customer_quantity']} | → | {sku_code} | {sku_name} | {huading_quantity} | {huading_unit} | {unit_type} | {status_icon}|"
             lines.append(line)
+            
+            # v5.13.2: 多候选 SKU 展示
+            if row.get("need_confirm") and row.get("candidates"):
+                lines.append(f"  ↳ ⚠️ 第{seq}行有多个同名SKU，请选择：")
+                for ci, c in enumerate(row["candidates"], 1):
+                    c_sku = c.get("sku_code", "")
+                    c_name = c.get("sku_name", "")
+                    c_unit = c.get("unit", "")
+                    c_type = c.get("unit_type", "")
+                    c_spec = c.get("product_spec", "")
+                    selected = " ← 当前选中" if c_sku == sku_code else ""
+                    lines.append(f"    {ci}. {c_sku} | {c_name} | {c_unit} | {c_type} | 规格:{c_spec}{selected}")
         
         lines.append("")
         lines.append("请输入指令：")
@@ -3610,6 +3741,18 @@ class OrderToHuadingTemplate:
         store_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
         store_font = Font(bold=True, color="000000", size=10)
 
+        # v5.14.0 audit: 多门店仓库编码强校验
+        missing_warehouse = []
+        for store_result in all_store_results:
+            si = store_result["store_info"]
+            if not si.get("warehouse_code", ""):
+                missing_warehouse.append(si.get("store_name", store_result.get("store_name", "未知门店")))
+        if missing_warehouse:
+            raise ValueError(
+                f"以下门店缺少仓库编码，无法生成模板：{', '.join(missing_warehouse)}。"
+                f"请检查仓库配置或确认门店匹配结果。"
+            )
+
         # 写表头
         for col_idx, field_name in enumerate(self.HUADING_FIELDS, start=1):
             cell = ws.cell(row=1, column=col_idx, value=field_name)
@@ -3642,7 +3785,7 @@ class OrderToHuadingTemplate:
                     "加急程度\n（0：普通，1：加急）": self.DEFAULT_VALUES["加急程度"],
                     "商品SKU编号": sku.get("sku_code", ""),
                     "商品三方SPEC编号": "",
-                    "单位类型": sku.get("unit_type", "大单位"),
+                    "单位类型": sku.get("unit_type", ""),  # v5.12.0 不再默认大单位
                     "出库数量": sku.get("quantity", 1),
                     "指定库存状态": self.DEFAULT_VALUES["指定库存状态"],
                     "出库类型": self.DEFAULT_VALUES["出库类型"],
@@ -3722,7 +3865,7 @@ class OrderToHuadingTemplate:
                     "匹配SKU编码": sku.get("sku_code", ""),
                     "SKU名称": sku.get("sku_name", ""),
                     "数量": sku.get("quantity", 0),
-                    "单位类型": sku.get("unit_type", "大单位"),
+                    "单位类型": sku.get("unit_type", ""),  # v5.12.0 不再默认大单位
                     "匹配单位": sku.get("unit", "件"),
                     # 辅助字段（用于调试）
                     "store": store_name,

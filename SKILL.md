@@ -24,7 +24,7 @@ metadata:
 
 **Description**: 将客户订单（Excel/图片/PDF/文字/Word）转换为华鼎31字段出库单模板的完整流程。
 
-**Version**: 5.12.0 (2026-06-10 — P1 bug修复：多门店 + 单 confirmed_store 正确处理；2 个回归测试)
+**Version**: 5.14.0 (2026-06-11 — 选SKU时考虑order_unit+规格,单位与SKU绑定；末尾孤立分隔符修复"果糖-"bug；多候选SKU展示；中文括号正则修复；unit_type动态选择)
 
 
 **架构**：工具层 + 数据库层 + 字段映射规则库 三层分离
@@ -623,6 +623,9 @@ AI 在执行任何 Skill 操作前，必须先读取并检查 `TOOLS.md` 配置�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 5.13.2 | 2026-06-10 | 多候选SKU展示给用户选择（选SKU即选单位）；修复 `_clean_product_name` 中文括号正则丢失 |
+| 5.13.1 | 2026-06-10 | SKU匹配与单位选择解耦：名称匹配后置单位精确匹配；`map_sku()` 委托给 `map_sku_batch()` |
+| 5.13.0 | 2026-06-10 | unit_type动态选择：去掉硬编码大单位，新增 `_resolve_unit_type()` 三级优先级 |
 | 5.12.0 | 2026-06-10 | P1 bug修复：多门店 + 单 confirmed_store 正确处理；引入 `confirmed_stores: Dict[str, Dict]`；2 个新回归测试 |
 | 5.8 | 2026-06-01 | 数据库合并：product_sku（1832条）+ product_name_alias（30条）；SKU匹配5层逻辑（Layer 0别名表）；删除system_sku + shipper_sku_mapping |
 | 5.3 | 2026-05-29 | 映射对照表9列字段规范化；移除门店标题分隔行；序号改为门店序号 |

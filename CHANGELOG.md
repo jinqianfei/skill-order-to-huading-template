@@ -1,9 +1,126 @@
+## [5.15.0] - 2026-06-11
+
+### Added
+- 新增功能
+
+**改动文件：**
+  • `CHANGELOG.md`
+  • `README.md`
+  • `SKILL.md`
+  • `VERSION`
+  • `__init__.py`
+  • `scripts/test_event_pipeline.py`
+  • `tools/_sku_mapper.py`
+  • `tools/_store_matcher.py`
+  • `tools/_template_generator.py`
+**触发来源：** session `auto-monitor`
+
 # Changelog
 
 All notable changes to this skill will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [5.14.0] - 2026-06-11
+
+### Changed
+- **选 SKU 时考虑 order_unit 和规格 (金姐指示 - "单位和 sku 是绑定的")**
+  - 新增 `_compute_match_score()` 统一打分函数 (Layer 2/2.5/3 共用)
+    - 基础权重 + `order_unit == sku_unit` 加成 +0.20 (强信号)
+    - `order_spec == db_spec` 加成 +0.10 (中信号)
+  - 新增 `_select_unique_best()` 选唯一最高分函数
+    - 唯一最高分 → 直接返回,不加 need_confirm
+    - 多个并列最高 → 返回 candidates + need_confirm=True
+  - 新增 `_build_with_candidates()` 复用 v5.13.2 的 candidates 机制
+  - **Layer 1/1b 多候选时按 order_unit 选**：唯一命中不返 candidates, 多个或 0 命中返 candidates
+  - **Layer 2 取消 `if clean_name != product_name` 限制**：v5.14.0 修复, 原限制导致 clean_name=果糖=product_name 时 Layer 2 跳过, 但 DB 里 SKU 叫 "果糖/新"必须走 Layer 2
+  - **未命中原因**："订单 1 件匹配到瓶"的 bug 根因是 Layer 1/1b 多候选时直接取 first, 没看 order_unit
+  - **设计原则**: SKU 和 unit 是绑定的, 不是单独匹配的
+
+### Why
+- 金姐 10:52 指出: "理论上来说单位和 sku 是绑定的不是单独匹配的"
+- v5.13.0 之前 `_resolve_unit_type()` 会选完 SKU 后按 order_unit 选 unit
+- v5.13.0 "用户选 SKU 即选单位" 改动后, order_unit 没人接了, 变成"先选 SKU 再看 unit"
+- 实际表现: 订单 1 件匹配到 12 瓶/件 SKU 错误, Layer 2/2.5/3 不看 order_unit, 排序后取 first
+
+### Behavior
+- `果糖+桶` → SK230904000008 (桶/小单位) 唯一命中 ✅
+- `果糖+箱` → SK230904000009 (箱/大单位) 唯一命中 ✅
+- `果糖` (无单位) → candidates 2 个 (小单位/大单位)
+- `果糖+件` (件不在DB) → candidates 2 个 (因为 order_unit 没命中任何 SKU)
+- **出库数量不换算** (金姐指示): quantity 保持原值, 不按 conversion_ratio 换算
+
+### CI 回归
+- 新增 B5/B6 测试用例 (8 个)
+- 旧 45 个测试 + 新 8 个 = **53 个测试全过**
+- 1 步 SKU 回归 + 1 步版本号核对 = 2 步 CI 全过
+
+## [5.13.3] - 2026-06-11
+
+### Fixed
+- **`_clean_product_name` 末尾孤立分隔符 bug（金姐反馈 - 沧州行别营店"果糖-"）**
+  - 问题：订单商品名 "果糖-"、"果糖_"、"-果糖" 这类带孤立分隔符的，清洗后仍保留符号
+  - 影响：Layer 1/1b 精确匹配失败 → 走 Layer 2 模糊匹配 → 名称相似度只有 66%（无 keyword_boost，因为 "果糖-" 不在 "果糖/新" 里）→ 综合分 0.6 < 0.7 阈值 → 整体未命中
+  - 修复：清洗函数末尾追加 `re.sub(r'[-_./\\,;:]+$', '', cleaned)` + `re.sub(r'^[-_./\\,;:]+', '', cleaned)`
+  - 修复后 "果糖-" → "果糖" → Layer 2 模糊匹配命中（66%名称+50%规格=0.6，需确认）
+
+### Why I Missed It
+- 之前只在 "_clean_product_name" docstring 里写了"保留连接符 -、-、_"
+- 没考虑到实际订单数据里 "-" 常作为"残留符号"出现（OCR 错误、人工输入漏字等）
+- 金姐反馈后才意识到：-作为分隔符（"D-X-H"）vs -作为孤立符号（"果糖-"）需要区别对待
+
+### Added
+- **CI 回归测试** (`scripts/test_sku_mapper_regression.py` + `scripts/ci_regression.sh`)
+  - 金姐 09:56 指示："OK，CI自动回归"
+  - **45 个测试用例**：32 单元测试（`_clean_product_name` 边界）+ 13 端到端测试（SKU 映射真实 DB）
+  - **覆盖**：中间连接符保留、末尾/开头孤立分隔符、两端都有、多连续、括号、空白、真实 SKU (椰子水/果糖/白糖糕D-X-H/浩然奥尔良翅中)
+  - **用法**：`bash scripts/ci_regression.sh` 或 `python3 scripts/test_sku_mapper_regression.py`
+  - **下次改 `_sku_mapper.py` 前必跑**，避免回归
+
+## [5.13.2] - 2026-06-10
+
+### Changed
+- **多候选SKU展示给用户选择**：用户选SKU即选单位（sku_code+unit+unit_type一体）
+  - Layer 0/1/1b 多同名SKU时返回 `candidates` 列表 + `need_confirm=True`
+  - `comparison_table` 增加 candidates 展示，用户可见所有候选SKU
+  - 去掉 `_resolve_unit_type` 后置自动选择，改为用户手动确认
+
+### Fixed
+- **`_clean_product_name` 中文括号正则丢失**：`r'[((][^))]*[))]'` 只匹配ASCII括号
+  - 修复为 `r'[\uff08(][^)\uff09]*[\uff09)]'`，同时匹配中文（）和英文()
+  - 影响：Layer 1b 无法匹配 "浩然奥尔良翅中（10袋）" 类商品名
+- 测试：单元测试 12/12，端到端 12/12 = 100%
+
+## [5.13.1] - 2026-06-10
+
+### Changed
+- **SKU匹配与单位选择解耦**：名称匹配和单位选择分成两个独立步骤
+  - `_map_single_in_batch()` 只做名称匹配，返回 sku_name
+  - `map_sku_batch()` 后置步骤：用 sku_name 查同名 SKU + 订单单位精确匹配选择
+  - `_resolve_unit_type()` 简化为：单位精确匹配 → 匹配不上用第一个 SKU
+  - `map_sku()` 委托给 `map_sku_batch()` 保持逻辑一致
+- 测试：单元测试 12/12，端到端 12/12 = 100%
+
+## [5.13.0] - 2026-06-10
+
+### Fixed
+- **P1 bug：unit_type 硬编码“大单位”导致所有订单始终返回大单位**
+  - 根因：`_sku_mapper.py` 所有 Layer SQL 含 `ORDER BY CASE WHEN unit_type = '大单位' THEN 0 ELSE 1 END`，强制优先返回大单位 SKU
+  - 表现：813 个同名多SKU商品（占全部 45%）始终返回大单位，无视订单实际数量/单位
+  - 修复：新增 `_resolve_unit_type()` 函数，三级优先级选择出库单位：
+    1. **订单单位精确匹配** — order_unit 与 SKU.unit 字段匹配
+    2. **“件”特殊规则** — 订单单位=“件”时直接选大单位（件=整件出库）
+    3. **数量+ratio 匹配** — order_quantity >= max_ratio → 大单位，否则 → 小单位
+  - 多个同 ratio 候选时设置 `need_confirm=True` 让用户确认
+  - 同步修复 `_template_generator.py` / `__init__.py` 中 6 处硬编码“大单位”默认值
+  - 测试：`tests/test_unit_type_fix.py` — 单元测试 17/18，端到端 12/12 = 100%
+
+### Changed
+- `map_sku()` 新增 `order_quantity` 参数（向后兼容，默认=1）
+- `_map_single_in_batch()` 新增 `quantity` 参数传递
+- `map_sku_batch()` 中 `alias_rows` 改为 `alias_groups` 支持同名多SKU
+- SQL 去除所有 `ORDER BY CASE WHEN unit_type = '大单位'` 硬编码排序
 
 ## [5.12.0] - 2026-06-10
 

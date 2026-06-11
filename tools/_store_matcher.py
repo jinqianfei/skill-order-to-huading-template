@@ -379,6 +379,7 @@ def _build_store_result(store: dict, match_type: str, match_method: str, db_conf
     """构建统一的门店信息返回格式"""
     warehouse_name = store.get("warehouse", "") or store.get("warehouse_name", "")
     warehouse_code = ""
+    warehouse_code_error = None
     if warehouse_name:
         try:
             import psycopg2
@@ -393,10 +394,10 @@ def _build_store_result(store: dict, match_type: str, match_method: str, db_conf
                 warehouse_code = row[0] or ""
             cur.close()
             conn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            warehouse_code_error = str(e)
 
-    return {
+    result = {
         "store_code": store.get("store_code", ""),
         "store_name": store.get("store_name", ""),
         "owner_code": store.get("owner_code", ""),
@@ -409,6 +410,9 @@ def _build_store_result(store: dict, match_type: str, match_method: str, db_conf
         "match_type": match_type,
         "match_method": match_method,
     }
+    if warehouse_code_error:
+        result["warehouse_code_error"] = warehouse_code_error
+    return result
 
 
 # ========== 数据库操作（内联，避免相对导入问题）==========
