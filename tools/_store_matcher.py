@@ -12,6 +12,25 @@ from difflib import SequenceMatcher
 import re
 
 
+def _strip_brand_prefix(store_name: str) -> str:
+    """去除品牌前缀，提取门店具体名称部分"""
+    # 常见品牌前缀（从实际数据中提取）
+    prefixes = [
+        "制茶青年-", "制茶青年",
+        "廖朵朵-", "廖朵朵蛋糕-", "廖朵朵",
+        "口口椰-K", "口口椰-", "口口椰",
+        "创宇-", "创宇",
+        "阿朴社长-", "阿朴社长济南-", "阿朴社长",
+        "V甜-", "V甜",
+        "哎渔村", "哎渔村-",
+    ]
+    for prefix in prefixes:
+        if store_name.startswith(prefix):
+            remainder = store_name[len(prefix):]
+            return remainder.lstrip("-").strip()
+    return store_name
+
+
 
 def _keyword_cross_match(store_name: str, db_config: Optional[dict]) -> Optional[dict]:
     """
@@ -141,13 +160,63 @@ def match_store(store_name: str, customer_company: str = None,
                         store_name.startswith("PN") or
                         len(store_name) < 3)
 
-    # 【修复】有手机号时优先尝试手机号精确匹配（最高准确率）
+    # 【v5.15.0】有手机号时匹配，增加门店名校验
     if phone:
-        store = _find_by_phone(phone, db_config)
-        if store:
-            return _build_store_result(store, "phone_exact",
-                                       f"手机号精确匹配（{phone}）", db_config)
-        # 手机号没匹配到，且store_name也无效时，尝试地址关键词（phone可能换了）
+        phone_result = _find_by_phone(phone, db_config)
+        if phone_result:
+            if isinstance(phone_result, dict) and phone_result.get("_multi"):
+                # 多门店共用手机号 → 按门店名相似度排序
+                stores = phone_result["stores"]
+                scored = []
+                for s in stores:
+                    # 先完整名称相似度
+                    sim = SequenceMatcher(None, store_name, s["store_name"]).ratio()
+                    if sim < 0.6:
+                        # 不够则去品牌前缀再算
+                        sim2 = SequenceMatcher(
+                            None,
+                            _strip_brand_prefix(store_name),
+                            _strip_brand_prefix(s["store_name"])
+                        ).ratio()
+                        sim = max(sim, sim2)
+                    scored.append((sim, s))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                best_sim, best_store = scored[0]
+
+                if best_sim >= 0.8:
+                    return _build_store_result(best_store, "phone_exact_high_conf",
+                                               f"手机号+门店名双重匹配（{phone}，{best_sim:.0%}）", db_config)
+                elif best_sim >= 0.6:
+                    result = _build_store_result(best_store, "phone_exact_multi",
+                                                 f"手机号匹配+门店名待确认（{phone}，{best_sim:.0%}）", db_config)
+                    result["need_confirm"] = True
+                    result["candidates"] = [_build_store_result(s, "phone_exact_multi",
+                                                 f"{phone}，{sim:.0%}", db_config)
+                                            for sim, s in scored if sim >= 0.5]
+                    return result
+                # else: 全部 < 0.6，不信任手机号，继续往下
+            else:
+                # 唯一命中 → 也要做门店名校验
+                sim = SequenceMatcher(None, store_name, phone_result["store_name"]).ratio()
+                if sim < 0.6:
+                    sim2 = SequenceMatcher(
+                        None,
+                        _strip_brand_prefix(store_name),
+                        _strip_brand_prefix(phone_result["store_name"])
+                    ).ratio()
+                    sim = max(sim, sim2)
+
+                if sim >= 0.8:
+                    return _build_store_result(phone_result, "phone_exact_high_conf",
+                                               f"手机号+门店名双重匹配（{phone}，{sim:.0%}）", db_config)
+                elif sim >= 0.6:
+                    result = _build_store_result(phone_result, "phone_exact",
+                                                 f"手机号匹配+门店名待确认（{phone}，{sim:.0%}）", db_config)
+                    result["need_confirm"] = True
+                    return result
+                # else: < 0.6，不信任手机号，继续往下
+
+        # 手机号没匹配到或门店名差异太大，且store_name也无效时，尝试地址关键词
         if _is_invalid_name and address:
             addr_result = _match_by_address_keyword(address, db_config)
             if addr_result:
@@ -497,7 +566,7 @@ def _get_by_owner(owner_code: str, db_config: Optional[dict] = None) -> List[dic
 
 
 def _find_by_phone(phone: str, db_config: Optional[dict] = None) -> Optional[dict]:
-    """按手机号精确查询门店"""
+    """按手机号查询门店（支持多门店复用场景）"""
     if not phone or not db_config:
         return None
     conn = _get_connection(db_config)
@@ -509,29 +578,30 @@ def _find_by_phone(phone: str, db_config: Optional[dict] = None) -> Optional[dic
                warehouse
         FROM store_list
         WHERE phone = %s
-        LIMIT 1
     """, (phone,))
 
-    r = cur.fetchone()
+    rows = cur.fetchall()
     cur.close()
     conn.close()
 
-    if not r:
+    if not rows:
         return None
 
-    return {
-        "store_code": r[0] or "",
-        "store_name": r[1] or "",
-        "owner_code": r[2] or "",
-        "owner_name": r[3] or "",
-        "province": r[4] or "",
-        "city": r[5] or "",
-        "district": r[6] or "",
-        "address": r[7] or "",
-        "phone": r[8] or "",
-        "contact_person": r[9] or "",
-        "warehouse": r[10] or "",
-    }
+    def _row_to_dict(r):
+        return {
+            "store_code": r[0] or "", "store_name": r[1] or "",
+            "owner_code": r[2] or "", "owner_name": r[3] or "",
+            "province": r[4] or "", "city": r[5] or "",
+            "district": r[6] or "", "address": r[7] or "",
+            "phone": r[8] or "", "contact_person": r[9] or "",
+            "warehouse": r[10] or "",
+        }
+
+    if len(rows) == 1:
+        return _row_to_dict(rows[0])
+
+    # 多门店共用手机号
+    return {"_multi": True, "stores": [_row_to_dict(r) for r in rows]}
 
 
 def _search_by_name(name: str, db_config: Optional[dict] = None) -> List[dict]:
