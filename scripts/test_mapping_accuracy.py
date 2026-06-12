@@ -29,6 +29,18 @@ PASS_COUNT = 0
 FAIL_COUNT = 0
 FAILURES = []
 
+# 🆕 分组统计 (v5.15.2): 每个测试组的 pass/fail 独立统计,用于末尾准确率汇总
+GROUP_STATS = {}  # {group_name: {"pass": int, "fail": int}}
+CURRENT_GROUP = ""
+
+
+def _set_group(name: str):
+    """设置当前测试组名 (在每组测试开头调用)"""
+    global CURRENT_GROUP
+    CURRENT_GROUP = name
+    if name not in GROUP_STATS:
+        GROUP_STATS[name] = {"pass": 0, "fail": 0}
+
 
 def _record(ok, name, detail=""):
     global PASS_COUNT, FAIL_COUNT
@@ -39,6 +51,12 @@ def _record(ok, name, detail=""):
         FAIL_COUNT += 1
         FAILURES.append((name, detail))
         print(f"  ❌ {name} -- {detail}")
+    # 🆕 分组统计
+    if CURRENT_GROUP and CURRENT_GROUP in GROUP_STATS:
+        if ok:
+            GROUP_STATS[CURRENT_GROUP]["pass"] += 1
+        else:
+            GROUP_STATS[CURRENT_GROUP]["fail"] += 1
 
 
 def _get_db_config():
@@ -65,6 +83,7 @@ def _get_db_config():
 
 def test_store_matching(db_config):
     """门店匹配准确率测试"""
+    _set_group("门店匹配")
     print("\n[A] 门店匹配准确率")
     print("-" * 60)
 
@@ -122,6 +141,7 @@ def test_store_matching(db_config):
 
 def test_owner_identification(db_config):
     """货主识别准确率测试 — 通过门店间接验证 owner_code"""
+    _set_group("货主识别")
     print("\n[B] 货主识别准确率 (门店→owner_code)")
     print("-" * 60)
 
@@ -168,6 +188,7 @@ def test_owner_identification(db_config):
 
 def test_unit_mapping(db_config):
     """单位映射准确率测试 — order_unit → unit_type + unit"""
+    _set_group("单位映射")
     print("\n[C] 单位映射准确率")
     print("-" * 60)
 
@@ -236,9 +257,200 @@ def test_unit_mapping(db_config):
             _record(False, tc["desc"], f"异常: {e}")
 
 
+# ===================== D: 仓库映射准确率 =====================
+
+def test_warehouse_mapping(db_config):
+    """仓库映射准确率测试 — warehouse_name → warehouse_code"""
+    _set_group("仓库映射")
+    print("\n[D] 仓库映射准确率")
+    print("-" * 60)
+
+    from tools._template_generator import get_warehouse_code
+    import psycopg2
+
+    # Part 1: 精确匹配测试 — 从 warehouse_code_mapping 表取样
+    conn = psycopg2.connect(**db_config)
+    cur = conn.cursor()
+
+    # 取 10 个有代表性的仓库 (覆盖高频使用的仓库)
+    cur.execute("""
+        SELECT wm.warehouse_name, wm.warehouse_code,
+               COUNT(sl.store_code) as store_count
+        FROM warehouse_code_mapping wm
+        LEFT JOIN store_list sl ON sl.warehouse = wm.warehouse_name
+        GROUP BY wm.warehouse_name, wm.warehouse_code
+        ORDER BY store_count DESC
+        LIMIT 10
+    """)
+    samples = cur.fetchall()
+    conn.close()
+
+    if not samples:
+        _record(False, "仓库映射", "warehouse_code_mapping 无数据")
+        return
+
+    for wh_name, expected_code, store_count in samples:
+        try:
+            actual_code = get_warehouse_code(wh_name, db_config)
+            matched = actual_code == expected_code
+            _record(matched,
+                    f"{wh_name} (关联{store_count}店) → {expected_code}",
+                    f"实际 code={actual_code}")
+        except Exception as e:
+            _record(False, f"{wh_name}", f"异常: {e}")
+
+    # Part 2: 门店关联仓库测试 — 门店匹配后 warehouse_code 是否正确
+    print()
+    print("  [D2] 门店→仓库 关联测试")
+    print("  " + "-" * 56)
+
+    conn = psycopg2.connect(**db_config)
+    cur = conn.cursor()
+
+    # 取每个货主各 1 个有仓库的门店
+    cur.execute("""
+        SELECT DISTINCT ON (sl.owner_code)
+               sl.store_name, sl.owner_code, sl.warehouse,
+               wm.warehouse_code as expected_wh_code
+        FROM store_list sl
+        JOIN warehouse_code_mapping wm ON wm.warehouse_name = sl.warehouse
+        WHERE sl.warehouse IS NOT NULL AND sl.warehouse != ''
+          AND sl.owner_code IS NOT NULL AND sl.owner_code != ''
+        ORDER BY sl.owner_code, sl.store_name
+    """)
+    store_wh_samples = cur.fetchall()
+    conn.close()
+
+    if not store_wh_samples:
+        _record(False, "门店→仓库关联", "无有仓库的门店数据")
+        return
+
+    from tools._store_matcher import match_store
+
+    for store_name, owner_code, wh_name, expected_wh_code in store_wh_samples:
+        try:
+            result = match_store(
+                store_name=store_name,
+                db_config=db_config,
+            )
+            if result is None:
+                _record(False, f"{store_name[:20]} → 仓库", "match_store 返回 None")
+                continue
+
+            actual_wh_code = result.get("warehouse_code", "")
+            matched = actual_wh_code == expected_wh_code
+            _record(matched,
+                    f"{store_name[:20]} → {wh_name} ({expected_wh_code})",
+                    f"实际 wh_code={actual_wh_code}")
+        except Exception as e:
+            _record(False, f"{store_name[:20]} → 仓库", f"异常: {e}")
+
+
+# ===================== E: SKU 映射准确率 =====================
+
+def test_sku_mapping(db_config):
+    """SKU 映射准确率测试 — 使用 D set 盲测数据 (20 条带 GT)"""
+    _set_group("SKU映射")
+    print("\n[E] SKU 映射准确率 (D set 盲测)")
+    print("-" * 60)
+
+    import json
+    from tools._sku_mapper import map_sku_batch
+
+    # 加载 D set 测试数据
+    test_data_path = os.path.join(
+        SKILL_DIR, "..", "..", "docs", "test_data", "test_set_D_blind_test.json"
+    )
+    test_data_path = os.path.abspath(test_data_path)
+    if not os.path.exists(test_data_path):
+        _record(False, "SKU 映射", f"测试数据不存在: {test_data_path}")
+        return
+
+    with open(test_data_path, "r", encoding="utf-8") as f:
+        test_items = json.load(f)
+
+    if not test_items:
+        _record(False, "SKU 映射", "D set 无数据")
+        return
+
+    # 按 shipper_id 分组，批量调用 map_sku_batch
+    from collections import defaultdict
+    by_shipper = defaultdict(list)
+    for item in test_items:
+        by_shipper[item["shipper_id"]].append(item)
+
+    for shipper_id, items in by_shipper.items():
+        # 构造 map_sku_batch 输入
+        batch_items = []
+        for i, item in enumerate(items):
+            batch_items.append({
+                "product_name": item["original_name"],
+                "spec": item.get("spec", ""),
+                "unit": item.get("unit", "件"),
+                "quantity": 1,
+                "seq": i + 1,
+            })
+
+        try:
+            results, unmatched = map_sku_batch(shipper_id, batch_items, db_config)
+        except Exception as e:
+            for item in items:
+                _record(False, f"{item['item_id']} {item['original_name'][:15]}",
+                        f"map_sku_batch 异常: {e}")
+            continue
+
+        # 逐个比对 GT
+        result_map = {r.get("seq"): r for r in results} if results else {}
+
+        for i, item in enumerate(items):
+            seq = i + 1
+            r = result_map.get(seq)
+
+            item_id = item["item_id"]
+            name_short = item["original_name"][:20]
+            expected_sku = item["expected_sku"]
+            expected_unit_type = item.get("expected_unit_type", "")
+
+            if r is None or not r.get("matched"):
+                _record(False,
+                        f"{item_id} {name_short} → {expected_sku}",
+                        "未匹配")
+                # 单位类型也记为失败
+                _record(False,
+                        f"{item_id} {name_short} → {expected_unit_type}",
+                        "未匹配，无法验证单位类型")
+                continue
+
+            actual_sku = r.get("sku_code", "")
+            actual_unit_type = r.get("unit_type", "")
+
+            # SKU 编码是否正确
+            sku_ok = actual_sku == expected_sku
+            _record(sku_ok,
+                    f"{item_id} {name_short} → {expected_sku}",
+                    f"实际 sku={actual_sku}, conf={r.get('confidence', 0):.2f}, layer={r.get('match_method', '')[:25]}")
+
+            # 单位类型是否正确
+            if expected_unit_type:
+                type_ok = actual_unit_type == expected_unit_type
+                _record(type_ok,
+                        f"{item_id} {name_short} → {expected_unit_type}",
+                        f"实际 unit_type={actual_unit_type}")
+
+        # 未匹配的也算失败
+        if unmatched:
+            for u in unmatched:
+                name = u.get("product_name", "")[:20]
+                _record(False,
+                        f"未匹配: {name}",
+                        "在 unmatched 列表中")
+
+
 # ===================== 主函数 =====================
 
 def main():
+    global PASS_COUNT, FAIL_COUNT
+
     print("=" * 60)
     print("映射准确率回归测试")
     print("=" * 60)
@@ -270,11 +482,37 @@ def main():
         traceback.print_exc()
         sys.exit(1)
 
-    # 汇总
+    # D: 仓库映射准确率
+    try:
+        test_warehouse_mapping(db_config)
+    except Exception as e:
+        print(f"\n❌ 仓库映射测试异常: {e}")
+        traceback.print_exc()
+        FAIL_COUNT += 1
+
+    # 🆕 E: SKU 映射准确率 (v5.15.2 新增)
+    try:
+        test_sku_mapping(db_config)
+    except Exception as e:
+        print(f"\n❌ SKU 映射测试异常: {e}")
+        traceback.print_exc()
+        FAIL_COUNT += 1
+
+    # 🆕 汇总 + 分组准确率
     total = PASS_COUNT + FAIL_COUNT
     print("\n" + "=" * 60)
     print(f"总计: {total} 个测试, {PASS_COUNT} ✅ 通过, {FAIL_COUNT} ❌ 失败")
     print("=" * 60)
+
+    # 🆕 分组准确率汇总
+    print("\n📊 准确率指标汇总:")
+    print("-" * 60)
+    for group_name, stats in GROUP_STATS.items():
+        g_total = stats["pass"] + stats["fail"]
+        g_pct = stats["pass"] / g_total * 100 if g_total > 0 else 0
+        status = "✅" if stats["fail"] == 0 else "⚠️" if g_pct >= 80 else "❌"
+        print(f"  {status} {group_name:12s}: {stats['pass']}/{g_total} ({g_pct:.0f}%)")
+    print("-" * 60)
 
     if FAILURES:
         print("\n失败列表:")

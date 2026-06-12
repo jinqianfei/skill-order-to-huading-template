@@ -27,6 +27,39 @@ if _SKILL_ROOT not in sys.path:
 from db.connection import get_connection, get_default_db_config
 from db.table_names import SKU_TABLE, WAREHOUSE_TABLE, ALIAS_TABLE, STORE_TABLE, ACTIVE_STATUS, SKU_CACHE_LIMIT, SKU_MATCH_LIMIT
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+
+def _load_yaml_sku_aliases(owner_code: str) -> Dict[str, str]:
+    """
+    加载 yaml SKU 别名表（自学习模块自动维护）
+    
+    Returns:
+        {order_product_name: system_product_name}
+    """
+    if yaml is None:
+        return {}
+    yaml_path = os.path.join(_SKILL_ROOT, "field_mapping", "rules", "sku_aliases_auto.yaml")
+    if not os.path.exists(yaml_path):
+        return {}
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        aliases = {}
+        for item in data.get("aliases", []):
+            if item.get("shipper_id") and item["shipper_id"] != owner_code:
+                continue  # 跳过其他货主的别名
+            order_name = item.get("order_product_name", "")
+            system_name = item.get("system_product_name", "")
+            if order_name and system_name:
+                aliases[order_name] = system_name
+        return aliases
+    except Exception:
+        return {}
+
 
 def _clean_product_name(name: str) -> str:
     """
@@ -413,11 +446,33 @@ def _map_sku_legacy(owner_code: str, product_name: str, unit: str = "",
     """, (owner_code, product_name))
     alias_rows = cur.fetchall()
     if alias_rows:
-        r = alias_rows[0]  # 临时取第一个,单位选择后置
-        conn.close()
-        result = _build_result(r, confidence=0.98, original_product_name=product_name)
-        result["match_method"] = "Layer 0 别名表精确匹配"
-        return result
+        if len(alias_rows) == 1:
+            r = alias_rows[0]
+            conn.close()
+            result = _build_result(r, confidence=0.98, original_product_name=product_name)
+            result["match_method"] = "Layer 0 别名表精确匹配"
+            return result
+        else:
+            # v5.15.1: 多候选时按 order_unit 选（和 Layer 1 逻辑一致）
+            if unit:
+                unit_matches = [r for r in alias_rows if r[2] == unit]
+                if len(unit_matches) == 1:
+                    r = unit_matches[0]
+                    conn.close()
+                    result = _build_result(r, confidence=0.98, original_product_name=product_name)
+                    result["match_method"] = f"Layer 0 别名表精确匹配 (单位命中: {unit})"
+                    return result
+                elif len(unit_matches) > 1:
+                    conn.close()
+                    return _build_with_candidates(
+                        unit_matches, confidence=0.98,
+                        original_product_name=product_name,
+                        match_method=f"Layer 0 别名表精确匹配 (多 SKU 同单位: {unit})")
+            conn.close()
+            return _build_with_candidates(
+                alias_rows, confidence=0.98,
+                original_product_name=product_name,
+                match_method="Layer 0 别名表精确匹配 (多候选待选)")
 
     # ========== Layer 1: 精确匹配(原始名称) ==========
     cur.execute(f"""
@@ -704,6 +759,18 @@ def map_sku_batch(owner_code: str, items: List[Dict],
         alias_groups.setdefault(r[0], []).append(r[1:])
     conn.close()
 
+    # v5.15.1: 加载 yaml SKU 别名（自学习模块维护，优先级高于 DB 别名）
+    yaml_aliases = _load_yaml_sku_aliases(owner_code)
+    # 将 yaml 别名合并到 alias_groups（yaml 优先）
+    for order_name, system_name in yaml_aliases.items():
+        if order_name in alias_groups:
+            continue  # DB 已有，不覆盖
+        # 从 all_skus 中查找 system_name 对应的 SKU
+        yaml_matches = [r for r in all_skus if r[1] == system_name]
+        if yaml_matches:
+            # 转换为和 DB 别名相同的格式: (sku_code, sku_name, unit, unit_type, conversion_ratio, product_spec, customer_code)
+            alias_groups[order_name] = [(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in yaml_matches]
+
     results = []
     unmatched_items = []
 
@@ -746,16 +813,33 @@ def _map_single_in_batch(owner_code, product_name, spec, unit, quantity,
     order_spec = _extract_spec_from_name(product_name)
     clean_name = _clean_product_name(product_name)
 
-    # Layer 0: 别名表（v5.13.2：多候选时返回 candidates 让用户选）
+    # Layer 0: 别名表（v5.15.1：多候选时按 order_unit 选，和 Layer 1 逻辑一致）
     if product_name in alias_groups:
         candidate_rows = alias_groups[product_name]
-        r = candidate_rows[0]
-        result = _build_result(r, confidence=0.98, original_product_name=product_name)
-        result["match_method"] = "Layer 0 别名表精确匹配"
-        if len(candidate_rows) > 1:
-            result["candidates"] = [_build_result(cr, confidence=0.98) for cr in candidate_rows]
-            result["need_confirm"] = True
-        return result
+        if len(candidate_rows) == 1:
+            r = candidate_rows[0]
+            result = _build_result(r, confidence=0.98, original_product_name=product_name)
+            result["match_method"] = "Layer 0 别名表精确匹配"
+            return result
+        else:
+            # 多候选 → 按 order_unit 选
+            if unit:
+                unit_matches = [m for m in candidate_rows if m[2] == unit]
+                if len(unit_matches) == 1:
+                    r = unit_matches[0]
+                    result = _build_result(r, confidence=0.98, original_product_name=product_name)
+                    result["match_method"] = f"Layer 0 别名表精确匹配 (单位命中: {unit})"
+                    return result
+                elif len(unit_matches) > 1:
+                    return _build_with_candidates(
+                        unit_matches, confidence=0.98,
+                        original_product_name=product_name,
+                        match_method=f"Layer 0 别名表精确匹配 (多 SKU 同单位: {unit})")
+            # 无 unit 或没匹配 → 返回 candidates
+            return _build_with_candidates(
+                candidate_rows, confidence=0.98,
+                original_product_name=product_name,
+                match_method="Layer 0 别名表精确匹配 (多候选待选)")
 
     # Layer 1: 精确匹配（v5.14.0：多候选时按 order_unit 选, 唯一命中不返 candidates）
     exact_matches = [r for r in all_skus if r[1] == product_name or r[6] == product_name]

@@ -394,7 +394,7 @@ def _get_download_url(output_file: str) -> str:
 class OrderToHuadingTemplate:
     """订单转华鼎出库单模板Skill"""
     
-    VERSION = "5.15.0"
+    VERSION = "5.15.1"
     
     # ========== AI调用约束（方案1：技术层面）==========
     # AI 只能调用这些公开接口，不得直接调用内部工具函数
@@ -1724,7 +1724,8 @@ class OrderToHuadingTemplate:
     
     def execute(self, order_input: str = None, output_file: str = None, order_type: str = "auto",
                 ocr_result: Dict = None, confirmed_store: Dict = None,
-                order_data_cache: Dict = None, confirmed_sku: Union[bool, Dict] = False) -> Dict[str, Any]:
+                order_data_cache: Dict = None, confirmed_sku: Union[bool, Dict] = False,
+                submitted_by: str = None) -> Dict[str, Any]:
         """
         执行订单转华鼎模板（支持多格式输入）
         
@@ -1920,6 +1921,20 @@ class OrderToHuadingTemplate:
                         si.setdefault("_store_key", store_key)
                         si.setdefault("store_name_submitted", store_name_for_match)
                         confirmed_stores[store_key] = si
+
+                        # v5.15.3 fix: 先跑系统匹配，判断是「确认」还是「纠正」
+                        _system_match = _call_match_store(
+                            store_name=store_name_for_match,
+                            customer_company=store_data.get("shipper_name", ""),
+                            db_config=self.db_config,
+                            phone=store_data.get("phone") or store_data.get("store_phone"),
+                            address=store_data.get("address") or store_data.get("store_address"),
+                            contact_person=store_data.get("contact_person"),
+                        )
+                        _system_store_code = (_system_match or {}).get("store_code", "") if isinstance(_system_match, dict) else ""
+                        _user_store_code = si.get("store_code", "")
+                        _is_correction = bool(_system_store_code and _user_store_code and _system_store_code != _user_store_code)
+
                         if _HAS_EVENT_BUS:
                             EventBus.emit("store_confirmed", {
                                 "session_id": order_session_id,
@@ -1931,6 +1946,27 @@ class OrderToHuadingTemplate:
                                 "match_type": si.get("match_type", "unknown"),
                                 "user_response_text": "user_provided_confirmed_store",
                             })
+                        # 自学习事件：门店纠正（仅当用户选的门店 ≠ 系统匹配的门店时）
+                        if _is_correction and _HAS_EVENT_BUS:
+                            try:
+                                EventBus.emit("store_corrected", {
+                                    "session_id": order_session_id,
+                                    "timestamp": time.time(),
+                                    "store_name_submitted": store_name_for_match,
+                                    "original_match": {
+                                        "store_code": _system_store_code,
+                                        "store_name": (_system_match or {}).get("store_name", ""),
+                                    },
+                                    "user_corrected_to": {
+                                        "store_code": si.get("store_code", ""),
+                                        "store_name": si.get("store_name", ""),
+                                        "owner_code": si.get("owner_code", ""),
+                                    },
+                                    "match_type": si.get("match_type", "unknown"),
+                                    "match_score": float(si.get("similarity", 1.0) or 1.0),
+                                })
+                            except Exception as _e:
+                                print(f"[WARN] emit store_corrected failed: {_e}", flush=True)
                     else:
                         si = _call_match_store(
                             store_name=store_name_for_match,
@@ -2105,6 +2141,20 @@ class OrderToHuadingTemplate:
                     store_info.setdefault("_store_key", store_key)
                     store_info.setdefault("store_name_submitted", store_name_val)
                     confirmed_stores[store_key] = store_info
+
+                    # v5.15.3 fix: 跑系统匹配判断是「确认」还是「纠正」
+                    _system_match_single = _call_match_store(
+                        store_name=store_name_val,
+                        customer_company=shipper_name_val,
+                        db_config=self.db_config,
+                        phone=phone_val,
+                        address=address_val,
+                        contact_person=contact_val,
+                    )
+                    _sys_code = (_system_match_single or {}).get("store_code", "") if isinstance(_system_match_single, dict) else ""
+                    _user_code = store_info.get("store_code", "")
+                    _is_correction_single = bool(_sys_code and _user_code and _sys_code != _user_code)
+
                     # v5.9.0 Phase 1：emit 门店已确认事件（单门店版）
                     if _HAS_EVENT_BUS:
                         EventBus.emit("store_confirmed", {
@@ -2117,6 +2167,27 @@ class OrderToHuadingTemplate:
                             "match_type": store_info.get("match_type", "unknown"),
                             "user_response_text": "user_provided_confirmed_store",
                         })
+                    # v5.15.3: 仅当用户选的门店 ≠ 系统匹配的门店时才 emit
+                    if _is_correction_single and _HAS_EVENT_BUS:
+                        try:
+                            EventBus.emit("store_corrected", {
+                                "session_id": order_session_id,
+                                "timestamp": time.time(),
+                                "store_name_submitted": store_name_val,
+                                "original_match": {
+                                    "store_code": _sys_code,
+                                    "store_name": (_system_match_single or {}).get("store_name", ""),
+                                },
+                                "user_corrected_to": {
+                                    "store_code": store_info.get("store_code", ""),
+                                    "store_name": store_info.get("store_name", ""),
+                                    "owner_code": store_info.get("owner_code", ""),
+                                },
+                                "match_type": store_info.get("match_type", "unknown"),
+                                "match_score": float(store_info.get("similarity", 1.0) or 1.0),
+                            })
+                        except Exception as _e:
+                            print(f"[WARN] emit store_corrected (single) failed: {_e}", flush=True)
                 else:
                     store_info = _call_match_store(
                         store_name=store_name_val,
@@ -2209,6 +2280,28 @@ class OrderToHuadingTemplate:
 
             # v5.14.0 audit: 即使 confirmed_sku=True, 有未匹配也不放行
             if not confirmed_sku or (total_unmatched > 0 and not isinstance(confirmed_sku, dict)):
+                # 自学习事件：SKU 需要用户确认
+                if _HAS_EVENT_BUS:
+                    try:
+                        _sku_items = []
+                        for _sr in all_store_results:
+                            for _sku in _sr.get("sku_results", []):
+                                _sku_items.append({
+                                    "seq": _sku.get("seq", 0),
+                                    "original_name": _sku.get("product_name", ""),
+                                    "match_layer": _sku.get("match_method", ""),
+                                    "match_score": float(_sku.get("confidence", 0) or 0),
+                                    "sku_code": _sku.get("sku_code", ""),
+                                    "sku_name": _sku.get("sku_name", ""),
+                                    "confidence": float(_sku.get("confidence", 0) or 0),
+                                })
+                        EventBus.emit("sku_confirm_needed", {
+                            "session_id": order_session_id,
+                            "timestamp": time.time(),
+                            "items": _sku_items,
+                        })
+                    except Exception as _e:
+                        print(f"[WARN] emit sku_confirm_needed failed: {_e}", flush=True)
                 return {
                     "success": False,
                     "need_sku_confirm": True,
@@ -2228,12 +2321,20 @@ class OrderToHuadingTemplate:
 
             # ========== v5.14.0 audit: 应用用户 SKU 修正 ==========
             if isinstance(confirmed_sku, dict) and "updates" in confirmed_sku:
+                _applied_updates = []
+                _failed_updates = []
                 for update in confirmed_sku["updates"]:
                     store_key = update.get("store_key", "")
                     seq = update.get("seq", 0)
                     new_sku_code = update.get("sku_code", "")
                     if not store_key or not seq or not new_sku_code:
+                        _failed_updates.append({
+                            "seq": seq, "store_key": store_key,
+                            "reason": "missing_required_field",
+                            "detail": f"store_key={store_key}, seq={seq}, sku_code={new_sku_code}"
+                        })
                         continue
+                    _update_found = False
                     for sr in all_store_results:
                         if sr.get("store_name") != store_key and sr.get("store_info", {}).get("_store_key") != store_key:
                             continue
@@ -2242,6 +2343,7 @@ class OrderToHuadingTemplate:
                             if ui.get("seq") == seq:
                                 # 将未匹配项移入 sku_results
                                 sr["unmatched_items"].pop(ui_idx)
+                                # v5.15.1 fix: 补齐 seq/spec/remark/product_spec，避免模板错行
                                 sr["sku_results"].append({
                                     "sku_code": new_sku_code,
                                     "sku_name": update.get("sku_name", ""),
@@ -2251,8 +2353,19 @@ class OrderToHuadingTemplate:
                                     "product_name": ui.get("product_name", ""),
                                     "match_method": "用户手动选择",
                                     "confidence": 1.0,
+                                    "seq": ui.get("seq", seq),
+                                    "spec": ui.get("spec", ""),
+                                    "product_spec": ui.get("spec", ""),
+                                    "remark": ui.get("remark", ""),
+                                    "original_product_name": ui.get("product_name", ""),
                                 })
+                                # v5.15.1 fix: 按 seq 重排 sku_results，保持原订单顺序
+                                sr["sku_results"].sort(key=lambda x: x.get("seq", 0))
+                                _applied_updates.append({"seq": seq, "sku_code": new_sku_code, "action": "fill_unmatched"})
+                                _update_found = True
                                 break
+                        if _update_found:
+                            break
                         # 检查已匹配项更新
                         for sku in sr.get("sku_results", []):
                             if sku.get("seq") == seq:
@@ -2265,7 +2378,26 @@ class OrderToHuadingTemplate:
                                 if update.get("quantity") is not None:
                                     sku["quantity"] = update["quantity"]
                                 sku["match_method"] = "用户手动修正"
+                                _applied_updates.append({"seq": seq, "sku_code": new_sku_code, "action": "update_existing"})
+                                _update_found = True
                                 break
+                    if not _update_found:
+                        _failed_updates.append({
+                            "seq": seq, "store_key": store_key,
+                            "reason": "store_key_or_seq_not_found",
+                            "detail": f"store_key={store_key}, seq={seq} 未找到匹配商品"
+                        })
+                # v5.15.1 fix: 如果有失败的 update，返回提示让用户知道哪些没生效
+                if _failed_updates:
+                    return {
+                        "success": False,
+                        "need_sku_confirm": True,
+                        "failed_updates": _failed_updates,
+                        "applied_updates": _applied_updates,
+                        "message": f"有 {len(_failed_updates)} 条修正未生效：{'; '.join('seq=' + str(f['seq']) + '(' + f['reason'] + ')' for f in _failed_updates)}",
+                        "all_store_results": all_store_results,
+                        "review_data": review_data,
+                    }
                 # 重新计算 unmatched
                 all_unmatched = []
                 total_unmatched = 0
@@ -2292,6 +2424,50 @@ class OrderToHuadingTemplate:
                 total_items = sum(len(r["sku_results"]) + len(r["unmatched_items"]) for r in all_store_results)
                 total_unmatched = sum(len(r["unmatched_items"]) for r in all_store_results)
                 has_issues = total_unmatched > 0 or review_data["summary"]["alert_count"] > 0
+                # 自学习事件：SKU 被用户纠正
+                if _HAS_EVENT_BUS:
+                    try:
+                        _corrected_items = []
+                        for _update in confirmed_sku.get("updates", []):
+                            _corrected_items.append({
+                                "seq": _update.get("seq", 0),
+                                "original_name": _update.get("product_name", ""),
+                                "user_corrected_to": {
+                                    "sku_code": _update.get("sku_code", ""),
+                                    "sku_name": _update.get("sku_name", ""),
+                                },
+                                "match_layer": "user_manual",
+                                "match_score": 1.0,
+                            })
+                        EventBus.emit("sku_corrected", {
+                            "session_id": order_session_id,
+                            "timestamp": time.time(),
+                            "items": _corrected_items,
+                        })
+                    except Exception as _e:
+                        print(f"[WARN] emit sku_corrected failed: {_e}", flush=True)
+            elif confirmed_sku is True:
+                # 自学习事件：SKU 被用户确认（无修改）
+                if _HAS_EVENT_BUS:
+                    try:
+                        _confirmed_items = []
+                        for _sr in all_store_results:
+                            for _sku in _sr.get("sku_results", []):
+                                _confirmed_items.append({
+                                    "seq": _sku.get("seq", 0),
+                                    "sku_code": _sku.get("sku_code", ""),
+                                    "sku_name": _sku.get("sku_name", ""),
+                                    "match_layer": _sku.get("match_method", ""),
+                                    "match_score": float(_sku.get("confidence", 0) or 0),
+                                    "confidence": float(_sku.get("confidence", 0) or 0),
+                                })
+                        EventBus.emit("sku_confirmed", {
+                            "session_id": order_session_id,
+                            "timestamp": time.time(),
+                            "items": _confirmed_items,
+                        })
+                    except Exception as _e:
+                        print(f"[WARN] emit sku_confirmed failed: {_e}", flush=True)
 
             # ========== 生成合并模板（所有门店写入同一个sheet）==========
             object.__getattribute__(self, '_generate_multi_store_template')(order_data, all_store_results, output_file)
@@ -2375,6 +2551,7 @@ class OrderToHuadingTemplate:
                         "owner_code": _first_store.get("owner_code", ""),
                         "source_file": order_input if isinstance(order_input, str) else "",
                         "output_file": output_file,
+                        "submitted_by": submitted_by,
                     })
                 except Exception as _e:
                     print(f"[WARN] emit order_complete failed: {_e}", flush=True)
